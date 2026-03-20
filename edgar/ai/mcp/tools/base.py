@@ -161,7 +161,7 @@ def tool(
                 "properties": params,
                 "required": required or []
             },
-            "output_schema": output_schema or TOOL_OUTPUT_SCHEMA,
+            **({"output_schema": output_schema} if output_schema else {}),
         }
         TOOLS[name] = entry
 

@@ -24,4 +24,4 @@ ratelimiter.sqlite*
 /coverage.xml
 .pyscn/
 # Training output (generated, not tracked)
-training/output/
+training/output/companies.pq

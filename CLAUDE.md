@@ -68,6 +68,30 @@ bd create --title "..." --type bug --priority P1  # Create issue
 
 **Statuses**: `open`, `in_progress`, `blocked`, `closed`
 
+## Fork & Upstream Sync
+
+This repo (`origin` = `sapientsai/edgartools`) is a **tail-along fork** of the active
+upstream project `dgunning/edgartools` (`upstream` remote). Our only custom commits are
+**deployment infrastructure** that upstream never touches: `Dockerfile`, `.dockerignore`,
+`.github/workflows/docker-mcp.yml`, plus small MCP tweaks in `edgar/ai/mcp/server.py`
+(a `/health` endpoint) and `edgar/ai/mcp/tools/base.py`.
+
+**To sync with upstream** (use merge, not rebase — `origin` is shared and CI builds from it):
+
+```bash
+git fetch upstream
+git merge upstream/main      # resolve any conflicts (usually only server.py / base.py)
+git push origin main         # no force-push
+```
+
+- GitHub's "Sync fork" button does **not** work here — it only fast-forwards forks with no
+  divergent commits, and we carry custom ones.
+- Conflict surface is tiny and limited to the two MCP files above. Keep custom changes out of
+  files upstream actively edits to keep merges clean.
+- **Goal**: upstream the `/health` endpoint and MCP improvements to `dgunning/edgartools` so
+  the fork shrinks to pure deployment files → future syncs become conflict-free / automatable
+  (e.g. a fetch→merge→push step in the monthly `docker-mcp.yml`).
+
 ## Development
 
 | Task | Reference |

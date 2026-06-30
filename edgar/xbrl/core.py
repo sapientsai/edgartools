@@ -14,6 +14,28 @@ PERIOD_START_LABEL = "http://www.xbrl.org/2003/role/periodStartLabel"
 PERIOD_END_LABEL = "http://www.xbrl.org/2003/role/periodEndLabel"
 TOTAL_LABEL = "http://www.xbrl.org/2003/role/totalLabel"
 
+# Standard XBRL taxonomy prefixes. Anything else in an element_id is a filer extension.
+# Used by calculation_linkbase() and Statement.extension_arcs() to distinguish
+# filer-authored concepts from standard taxonomy concepts.
+STANDARD_TAXONOMIES = frozenset({
+    'us-gaap', 'dei', 'srt', 'ifrs', 'ifrs-full',
+    'country', 'currency', 'exch', 'ecd',
+    'naics', 'sic', 'stpr', 'invest',
+})
+
+
+def split_element_id(element_id: str) -> Tuple[str, str]:
+    """Split an element ID like 'us-gaap_Revenues' or 'tsla_RestructuringAndOtherExpenses'
+    into (taxonomy_prefix, local_name) on the FIRST underscore.
+
+    Handles 'us-gaap' correctly (contains a hyphen, not an underscore separator).
+    Returns ('', element_id) if there is no underscore.
+    """
+    if not element_id or '_' not in element_id:
+        return '', element_id or ''
+    prefix, _, local = element_id.partition('_')
+    return prefix, local
+
 # XML namespaces
 NAMESPACES = {
     "xlink": "http://www.w3.org/1999/xlink",
@@ -121,7 +143,7 @@ def classify_duration(days: int) -> str:
         return "Period"
 
 
-def determine_dominant_scale(statement_data: List[Dict[str, Any]], 
+def determine_dominant_scale(statement_data: List[Dict[str, Any]],
                              periods_to_display: List[Tuple[str, str]]) -> int:
     """
     Determine the dominant scale (thousands, millions, billions) for a statement.
@@ -146,7 +168,7 @@ def determine_dominant_scale(statement_data: List[Dict[str, Any]],
         # Skip items that appear to be share counts or ratios
         label_lower = item['label'].lower()
         if any(keyword in label_lower for keyword in [
-            'shares', 'share', 'stock', 'eps', 'earnings per share', 
+            'shares', 'share', 'stock', 'eps', 'earnings per share',
             'weighted average', 'number of', 'per common share', 'per share',
             'per basic', 'per diluted', 'outstanding', 'issued',
             'ratio', 'margin', 'percentage', 'rate', 'per cent'
@@ -200,7 +222,7 @@ def determine_dominant_scale(statement_data: List[Dict[str, Any]],
         # Skip items that appear to be share counts or ratios
         label_lower = item['label'].lower()
         if any(keyword in label_lower for keyword in [
-            'shares', 'share', 'stock', 'eps', 'earnings per share', 
+            'shares', 'share', 'stock', 'eps', 'earnings per share',
             'weighted average', 'number of', 'per common share', 'per share',
             'per basic', 'per diluted', 'outstanding', 'issued',
             'ratio', 'margin', 'percentage', 'rate', 'per cent'

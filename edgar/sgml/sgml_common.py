@@ -298,6 +298,34 @@ class FilingSGML:
                 html_text = html_text.decode('utf-8')
             return html_text
 
+    def text(self) -> Optional[str]:
+        """
+        Return the plain text of the primary filing document, read from the parsed SGML.
+
+        Historic pre-HTML filings are returned as fixed-width plain text (page-break
+        markers removed); HTML primary documents are converted to text. Returns None
+        when there is no primary document content.
+
+        No network access is required when the SGML was parsed from a local source, which
+        makes this the offline-friendly way to extract text from historic text-only filings.
+        """
+        primary = self.attachments.primary_documents
+        if not primary:
+            return None
+        content = primary[0].content
+        if isinstance(content, bytes):
+            content = content.decode('utf-8', 'replace')
+        if not content or not content.strip():
+            return None
+
+        from edgar.core import is_probably_html
+        if is_probably_html(content):
+            from edgar.documents import HTMLParser, ParserConfig
+            from edgar.richtools import rich_to_text
+            document = HTMLParser(ParserConfig(form=self.form)).parse(content)
+            return "" if document.is_empty else rich_to_text(document, width=500)
+        return content.replace("<PAGE>", "")
+
     def xml(self):
         xml_document = self.attachments.primary_xml_document
         if xml_document and not xml_document.is_binary() and not xml_document.empty:

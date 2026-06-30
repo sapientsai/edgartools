@@ -8,7 +8,6 @@ from typing import Any, Dict, List, Optional, Union
 
 import pandas as pd
 import pyarrow as pa
-from httpx import HTTPStatusError
 
 from edgar.core import get_edgar_data_directory, listify, log
 from edgar.httprequests import download_file, download_json
@@ -282,19 +281,36 @@ def get_company_cik_lookup():
     return lookup
 
 
+# Manual overrides for CIKs where the shortest non-hyphenated ticker is wrong
+_PREFERRED_TICKER = {
+    1166691: 'CMCSA',   # Comcast common stock, not CCZ (ETN)
+    1161611: 'ALMMF',   # Aluminum Corp of China, not ACH (conflicts with CIK 75252)
+    1787518: 'DFNSW',   # T3 Defense, not DFNS (conflicts with CIK 1777946)
+}
+
+
 @lru_cache(maxsize=1)
 def get_cik_ticker_lookup():
-    """Create a mapping of CIK to base ticker symbols.
-    For CIKs with multiple tickers, uses the shortest ticker (usually the base symbol).
+    """Create a mapping of CIK to the primary ticker symbol for each CIK.
+
+    For CIKs with multiple tickers, prefers non-hyphenated tickers (common stock)
+    over hyphenated ones (share classes like BRK-A), then picks the shortest.
     """
-    company_lookup = get_company_cik_lookup()
-    cik_to_tickers = {}
-    for ticker, cik in company_lookup.items():
-        # Prefer the base ticker (without share class)
-        base_ticker = ticker.split('-')[0]
-        if cik not in cik_to_tickers or len(base_ticker) < len(cik_to_tickers[cik]):
-            cik_to_tickers[cik] = base_ticker
-    return cik_to_tickers
+    df = get_cik_tickers()
+    cik_to_ticker = {}
+    for ticker, cik in zip(df['ticker'], df['cik'], strict=False):
+        has_hyphen = '-' in ticker
+        prev = cik_to_ticker.get(cik)
+        if prev is None:
+            cik_to_ticker[cik] = ticker
+        else:
+            prev_has_hyphen = '-' in prev
+            # Prefer non-hyphenated over hyphenated; among equals, prefer shortest
+            if (prev_has_hyphen and not has_hyphen) or \
+               (prev_has_hyphen == has_hyphen and len(ticker) < len(prev)):
+                cik_to_ticker[cik] = ticker
+    cik_to_ticker.update(_PREFERRED_TICKER)
+    return cik_to_ticker
 
 
 @lru_cache(maxsize=128)
@@ -551,12 +567,17 @@ def get_icon_from_ticker(ticker: str) -> Optional[bytes]:
             f"https://raw.githubusercontent.com/nvstly/icons/main/ticker_icons/{ticker_for_url}.png", as_text=False)
         # download_file with as_text=False returns bytes
         return downloaded if isinstance(downloaded, bytes) else None
-    except HTTPStatusError as e:
-        # If the status code is 404, the icon is not available
-        if e.response.status_code == 404:
+    except Exception as e:
+        # If the status code is 404, the icon is not available.
+        # Duck-type on the response rather than the exception class: depending on
+        # the installed httpx build the raised type may not be our imported
+        # HTTPStatusError (e.g. CI environments surface it under a different module
+        # identity such as httpx2), so matching on isinstance is fragile. Any
+        # exception that isn't a 404 is re-raised unchanged.
+        response = getattr(e, "response", None)
+        if response is not None and getattr(response, "status_code", None) == 404:
             return None
-        else:
-            raise
+        raise
 
 def popular_us_stocks():
     df = (read_csv_from_package('popular_us_stocks.csv', dtype={'Cik': int})

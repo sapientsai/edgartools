@@ -67,7 +67,7 @@ from edgar.reference.tickers import Exchange, find_ticker, find_ticker_safe
 from edgar.richtools import Docs, print_rich, repr_rich, rich_to_text
 from edgar.search import BM25Search, RegexSearch
 from edgar.sgml import FilingHeader, FilingSGML, Reports, Statements
-from edgar.storage import is_using_local_storage, local_filing_path
+from edgar.storage import is_using_local_storage, local_filing_path, resolve_local_filing_path
 from edgar.xbrl import XBRL, XBRLFilingWithNoXbrlData
 
 """ Contain functionality for working with SEC filing indexes and filings
@@ -1562,14 +1562,26 @@ class Filing:
         Get the period of report for the filing
         """
         period = self.sgml().period_of_report
-        if not period:
-            # Fallback: extract from homepage index page
+        if not period and not is_using_local_storage():
+            # Fallback: extract from homepage index page (network call)
+            # Skip when local storage is enabled to avoid unexpected network access
             try:
                 period = self.homepage.period_of_report
             except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadTimeout,
                     httpcore.TimeoutException, httpcore.ConnectError, httpcore.NetworkError):
                 pass  # Offline or network unavailable — return None
         return period
+
+    @cached_property
+    def agent(self) -> Optional[str]:
+        """Identify the filing agent that prepared this filing (e.g. Workiva, Donnelley)."""
+        from edgar.documents.agents import detect_filing_agent
+        doc = self.sgml().attachments.primary_html_document
+        if not doc:
+            doc = self.homepage.primary_html_document
+        if doc and doc.content:
+            return detect_filing_agent(doc.content)
+        return None
 
     @property
     def attachments(self):
@@ -1600,6 +1612,17 @@ class Filing:
                 ownership: Ownership = self.obj()
                 html = ownership.to_html()
             else:
+                # Only call self.obj() for XML-native forms (XmlFiling, etc.)
+                # that have to_html() rendering. Skip for HTML-based data objects
+                # (S-1, S-3, 424B, etc.) whose from_filing() calls html(),
+                # which would cause infinite recursion.
+                from edgar.xmlfiling import XML_FILING_FORMS
+                if self.form in XML_FILING_FORMS:
+                    xml_obj = self.obj()
+                    if xml_obj and hasattr(xml_obj, 'to_html'):
+                        rendered = xml_obj.to_html()
+                        if rendered:
+                            return rendered
                 html = self.homepage.primary_html_document.download()
         if isinstance(html, bytes):
             try:
@@ -1631,6 +1654,16 @@ class Filing:
     @lru_cache(maxsize=4)
     def text(self) -> str:
         """Convert the html of the main filing document to text"""
+        # Offline shortcut for historic pre-HTML filings: when the primary document has no
+        # <FILENAME> (so html()/_download_filing_text would otherwise re-fetch it over the
+        # network) and it is plain text, return that document's text straight from the
+        # locally-parsed SGML. This yields the same <TEXT> body the network path returns.
+        # Tightly scoped — <FILENAME>-less, non-binary, non-XML, non-HTML, no TEXT-EXTRACT
+        # sibling — so every other shape (HTML, XML, PDF UPLOAD, TEXT-EXTRACT) is unaffected.
+        local_text = self._local_primary_text()
+        if local_text is not None:
+            return local_text
+
         html_content = self.html()
         if html_content and is_probably_html(html_content):
             parser = HTMLParser(ParserConfig(form=self.form))
@@ -1649,6 +1682,40 @@ class Filing:
             else:
                 return self._download_filing_text()
 
+    def _local_primary_text(self) -> Optional[str]:
+        """Return the primary document's plain text from the locally-parsed SGML, or None.
+
+        Only returns a value for the historic pre-HTML case — a <FILENAME>-less primary
+        document that is plain text (not binary/XML/HTML) and has no TEXT-EXTRACT sibling.
+        For every other filing this returns None so text() falls through to its normal path,
+        preserving existing behavior (HTML rendering, XML→"", PDF UPLOAD via TEXT-EXTRACT).
+        """
+        try:
+            sgml = self.sgml()
+        except Exception:
+            return None
+        if sgml is None:
+            return None
+        if len(self.attachments.query("document_type == 'TEXT-EXTRACT'")) > 0:
+            return None
+        primary = sgml.attachments.primary_documents
+        if not primary:
+            return None
+        doc = primary[0]
+        # Require a <FILENAME>-less primary (the historic pre-HTML shape). Filings with a
+        # named primary keep their existing text() path, including homepage HTML rendering.
+        if not doc.empty or doc.is_binary() or doc.is_xml():
+            return None
+        content = doc.content
+        if isinstance(content, bytes):
+            content = content.decode('utf-8', 'replace')
+        if not content or not content.strip():
+            return None
+        stripped = content.lstrip()
+        if is_probably_html(content) or stripped.startswith('<?xml'):
+            return None
+        return content
+
     def _download_filing_text(self):
         """
         Download the text of the filing directly from the primary text sources.
@@ -1665,8 +1732,8 @@ class Filing:
     def full_text_submission(self) -> str:
         """Return the complete text submission file"""
         if is_using_local_storage():
-            local_path = self._local_path()
-            if local_path.exists():
+            local_path = resolve_local_filing_path(str(self.filing_date), self.accession_no)
+            if local_path is not None:
                 from edgar.sgml.sgml_common import read_content_as_string
                 return read_content_as_string(local_path)
         downloaded = download_file(self.text_url, as_text=True)
@@ -1858,8 +1925,8 @@ class Filing:
         if self._sgml:
             return self._sgml
         if is_using_local_storage():
-            local_path = local_filing_path(str(self.filing_date), self.accession_no)
-            if local_path.exists():
+            local_path = resolve_local_filing_path(str(self.filing_date), self.accession_no)
+            if local_path is not None:
                 self._sgml = FilingSGML.from_source(local_path)
 
         if self._sgml is None:
@@ -1868,6 +1935,17 @@ class Filing:
                 self._sgml = get_datamule_filing(self.accession_no)
 
         if self._sgml is None:
+            if is_using_local_storage():
+                # Network fallback is a supported mode (allow_network_fallback=True), so a
+                # genuine local miss is routine, not anomalous — keep this at debug to avoid
+                # per-filing noise in bulk loops. When fallback is disabled the code below
+                # raises, surfacing the problem directly.
+                log.debug(
+                    f"Filing bundle {self.accession_no} not found in local storage "
+                    f"(searched the {self.filing_date} feed folder and adjacent days). "
+                    f"Falling back to full network fetch. To avoid this, run "
+                    f"download_filings(filing_date='{self.filing_date}')."
+                )
             try:
                 self._sgml = FilingSGML.from_filing(self)
             except (ValueError, Exception) as e:
@@ -1905,6 +1983,21 @@ class Filing:
         """
         if self.reports:
             return self.reports.statements
+
+    @cached_property
+    def viewer(self):
+        """
+        Get the SEC Interactive Data Viewer for this filing.
+
+        Returns a FilingViewer with categorized report navigation,
+        concept-annotated data, and a navigable concept graph.
+        Requires an XBRL filing with MetaLinks.json in the SGML bundle.
+
+        Returns:
+            FilingViewer if MetaLinks.json is available, None otherwise
+        """
+        from edgar.xbrl.viewer import FilingViewer
+        return FilingViewer.from_filing(self)
 
     @cached_property
     def index_headers(self) -> IndexHeaders:
@@ -1989,8 +2082,14 @@ class Filing:
     @lru_cache(maxsize=1)
     def sections(self) -> List[str]:
         html = self.html()
-        assert html is not None
-        return html_sections(html)
+        if html is not None:
+            return html_sections(html)
+        # Old text-only filings (pre-2002) — chunk on <PAGE> markers.
+        text = self.text()
+        if not text:
+            return []
+        chunks = [c.strip() for c in re.split(r"<PAGE>|\n\s*\n", text) if len(c.strip()) >= 50]
+        return chunks if chunks else [text]
 
     @cached_property
     def __get_bm25_search_index(self):
@@ -2003,10 +2102,107 @@ class Filing:
     def search(self,
                query: str,
                regex=False):
-        """Search for the query string in the filing HTML"""
+        """Search for the query string in the filing HTML.
+
+        Returns a ``SearchResults`` whose rendered output highlights the matched
+        query terms in bold red. With ``regex=False`` (default, BM25 relevance
+        search) each query word is highlighted as a case-insensitive substring,
+        so "repurchase" also lights up "repurchases". With ``regex=True`` the
+        matches of the regex pattern itself are highlighted.
+        """
         if regex:
             return self.__get_regex_search_index.search(query)
         return self.__get_bm25_search_index.search(query)
+
+    def grep(self, pattern: str, *, regex: bool = False, document: Optional[str] = None) -> 'GrepResult':
+        """
+        Grep for exact text matches across all filing documents.
+
+        Like `grep -ri` on a directory — searches the primary document and all
+        exhibits/attachments by default. Case-insensitive. Returns every match
+        with its location (which document) and surrounding context.
+
+        Args:
+            pattern: Text to search for (exact match, case-insensitive)
+            regex: If True, treat pattern as a regular expression
+            document: Narrow search to a specific document. Use "primary" for
+                     the main filing document, or a document type like "EX-10.1"
+
+        Returns:
+            GrepResult containing GrepMatch objects with location and context
+
+        Examples:
+            >>> filing.grep("going concern")
+            >>> filing.grep("Level 3", document="primary")
+            >>> filing.grep(r"Level\\s+3", regex=True)
+        """
+        from edgar.search.grep import GrepResult, _grep_text
+
+        all_matches = []
+        found_any_text = False
+
+        try:
+            attachments = self.attachments
+        except Exception:
+            attachments = []
+
+        for attachment in attachments:
+            if document and not self._attachment_matches(attachment, document):
+                continue
+            if attachment.empty or attachment.is_binary():
+                continue
+
+            try:
+                text = attachment.text()
+            except Exception as e:
+                log.debug(f"grep: could not extract text from {attachment.document}: {e}")
+                continue
+
+            if not text:
+                continue
+
+            found_any_text = True
+            location = self._attachment_location(attachment)
+            all_matches.extend(_grep_text(text, pattern, location, regex=regex))
+
+        # Old text filings: SGML returns empty attachment shells, fall back to filing.text().
+        if not found_any_text and (document is None or document.lower() == "primary"):
+            all_matches.extend(self._grep_filing_text(pattern, regex))
+
+        return GrepResult(pattern, all_matches)
+
+    @staticmethod
+    def _attachment_matches(attachment, document: str) -> bool:
+        """Whether `attachment` satisfies grep()'s `document` filter."""
+        if document.lower() == "primary":
+            return attachment.sequence_number == "1"
+        doc_type = (attachment.document_type or "").upper()
+        if document.upper() in doc_type:
+            return True
+        return document.lower() in (attachment.document or "").lower()
+
+    @staticmethod
+    def _attachment_location(attachment) -> str:
+        """Label for an attachment in grep result locations."""
+        if attachment.sequence_number == "1":
+            return "primary"
+        if attachment.document_type:
+            return attachment.document_type
+        return attachment.document or f"doc-{attachment.sequence_number}"
+
+    def _grep_filing_text(self, pattern: str, regex: bool) -> list:
+        """Grep the combined filing text as a 'primary' document.
+
+        Used by grep() when no attachment yields usable text — covers older
+        plain-text filings whose SGML decomposition emits empty shells.
+        """
+        from edgar.search.grep import _grep_text
+        try:
+            text = self.text()
+        except Exception as e:
+            log.debug(f"grep: could not extract filing text: {e}")
+            return []
+        return _grep_text(text, pattern, "primary", regex=regex) if text else []
 
     @property
     def filing_url(self) -> str:
@@ -2099,6 +2295,45 @@ class Filing:
         return company.get_filings(file_number=file_number,
                                    sort_by=[("filing_date", "ascending"), ("accession_number", "ascending")])
 
+    def correspondence(self) -> Optional['CorrespondenceThread']:
+        """Get the correspondence thread for this filing.
+
+        Works on ANY filing type (not just CORRESP/UPLOAD). For example,
+        calling correspondence() on a 10-K will find any SEC review
+        correspondence related to that 10-K via file_number.
+
+        Returns:
+            CorrespondenceThread or None if no correspondence found.
+        """
+        from edgar.correspondence import Correspondence, CorrespondenceThread, CorrespondenceType, CORRESPONDENCE_FORMS
+
+        # If this is already a correspondence filing, parse and get its thread
+        if self.form in CORRESPONDENCE_FORMS:
+            c = Correspondence.from_filing(self)
+            return c.thread
+
+        # For other filings, build a synthetic Correspondence with the file_number
+        # from EDGAR metadata and delegate to CorrespondenceThread
+        company = self.get_entity()
+        if not company:
+            return None
+
+        filings = company.get_filings(accession_number=self.accession_no)
+        if not filings or filings.empty:
+            return None
+        file_number = filings[0].file_number
+        if not file_number:
+            return None
+
+        # Create a minimal Correspondence to anchor the thread search
+        anchor = Correspondence(
+            filing=self,
+            body=None,
+            correspondence_type=CorrespondenceType.COMPANY_LETTER,
+            referenced_file_number=file_number,
+        )
+        return CorrespondenceThread.from_correspondence(anchor)
+
     def __hash__(self):
         return hash(self.accession_no)
 
@@ -2146,7 +2381,8 @@ class Filing:
                 Returns: FormC (crowdfunding offering details)
               - Use .docs for detailed API documentation
               - Use .xbrl() for financial statements (if available)
-              - Use .document() for structured text extraction
+              - Use .text() or .markdown() for full document text
+              - Use .document for the primary document (Attachment)
               - Use .attachments for exhibits (5 documents)
         """
         from edgar import get_obj_info
@@ -2204,7 +2440,8 @@ class Filing:
                                                                                 '6-K'] else "(if available)"
             lines.append(f"  - Use .xbrl() {xbrl_hint}")
 
-            lines.append("  - Use .document() for structured text extraction")
+            lines.append("  - Use .text() or .markdown() for full document text")
+            lines.append("  - Use .document for the primary document (Attachment)")
 
             # Add attachments info if available
             try:
@@ -2294,13 +2531,24 @@ class Filing:
         attachments = self.attachments
 
         # The filing information table
-        filing_info_table = Table("Accession Number", "Filing Date", "Period of Report", "Documents",
+        # Include agent column only if it's been detected (avoids triggering
+        # a network call just for display — agent is a cached_property)
+        agent_name = self.__dict__.get('agent')  # Check cache without triggering lookup
+        info_columns = ["Accession Number", "Filing Date", "Period of Report", "Documents"]
+        if agent_name:
+            info_columns.append("Agent")
+        filing_info_table = Table(*info_columns,
                                   header_style="dim",
                                   box=box.SIMPLE_HEAD)
-        filing_info_table.add_row(accession_number_text(self.accession_no),
-                                  Text(str(self.filing_date), "bold"),
-                                  Text(self.period_of_report or "-", "bold"),
-                                  f"{len(attachments)}")
+        info_row = [
+            accession_number_text(self.accession_no),
+            Text(str(self.filing_date), "bold"),
+            Text(self.period_of_report or "-", "bold"),
+            f"{len(attachments)}",
+        ]
+        if agent_name:
+            info_row.append(Text(agent_name, "cyan"))
+        filing_info_table.add_row(*info_row)
 
         # Build content elements
         elements = [filing_info_table]
@@ -2567,7 +2815,9 @@ def unicode_for_form(form: str) -> str:
         return '💬'  # Speech bubble for communications
 
     # Proxy statements
-    elif form in ['DEF 14A', 'PRE 14A', 'DEFA14A', 'DEFC14A']:
+    elif form in ['DEF 14A', 'PRE 14A', 'DEFA14A', 'DEFC14A', 'DEFM14A', 'DEFN14A',
+                  'DFAN14A', 'DEFR14A', 'DFRN14A', 'PREC14A', 'PREM14A', 'PREN14A',
+                  'PRER14A', 'PRRN14A', 'PX14A6G', 'PX14A6N']:
         return '📩'  # Envelope for shareholder communications
 
     # Default case - generic document

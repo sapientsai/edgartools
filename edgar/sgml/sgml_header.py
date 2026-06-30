@@ -463,6 +463,8 @@ class FilingHeader:
         metadata = {
             "ACCESSION NUMBER": parsed_data.get("ACCESSION-NUMBER"),
             "CONFORMED SUBMISSION TYPE": parsed_data.get("TYPE"),
+            "PUBLIC DOCUMENT COUNT": parsed_data.get("PUBLIC-DOCUMENT-COUNT"),
+            "CONFORMED PERIOD OF REPORT": parsed_data.get("PERIOD"),
             "FILED AS OF DATE": parsed_data.get("FILING-DATE"),
             "DATE AS OF CHANGE": parsed_data.get("DATE-OF-FILING-DATE-CHANGE"),
             "EFFECTIVE DATE": parsed_data.get("EFFECTIVENESS-DATE"),
@@ -751,7 +753,20 @@ class FilingHeader:
             # The line ends with a ':' meaning nested content follows e.g. "REPORTING-OWNER:"
             line_ends_with_colon = line.rstrip('\t').endswith(':')
 
-            is_header = (nesting_level == 0 and line_ends_with_colon) or nesting_will_increase
+            # A colon-ending line is a section header only when nested content actually
+            # follows it (after any blank lines). Otherwise it is a key with an empty value
+            # — e.g. "CONFIRMING COPY:" — which must be captured as a key/value rather than a
+            # section, or it would swallow every following top-level field (FILED AS OF DATE,
+            # CONFORMED PERIOD OF REPORT, ...). Blank lines commonly separate a real section
+            # header (e.g. "FILER:") from its nested body, so skip them when looking ahead.
+            next_nonblank_nesting = nesting_level
+            for next_line in lines[index + 1:]:
+                if next_line.strip():
+                    next_nonblank_nesting = len(next_line) - len(next_line.lstrip('\t'))
+                    break
+            followed_by_nested = next_nonblank_nesting > nesting_level
+
+            is_header = (line_ends_with_colon and followed_by_nested) or nesting_will_increase
             if is_header:
                 # Nested line means a subheader e.g. "OWNER DATA:"
                 if line.startswith('\t'):

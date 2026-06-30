@@ -9,15 +9,13 @@ from rich import box
 from rich.table import Table
 
 from edgar.datatools import clean_column_text, table_html_to_dataframe
+from edgar.files._deprecation import warn_legacy_html_usage
 from edgar.richtools import repr_rich
 
-# Deprecation warning for legacy HtmlDocument
-warnings.warn(
-    "edgar.files.html_documents module (including HtmlDocument) is deprecated and will be removed in v6.0. "
-    "Please use edgar.documents.HTMLParser instead. "
-    "See migration guide: https://edgartools.readthedocs.io/en/latest/migration/",
-    DeprecationWarning,
-    stacklevel=2
+_HTML_DOCUMENTS_DEPRECATION_MSG = (
+    "edgar.files.html_documents (including HtmlDocument) is deprecated and "
+    "will be removed in v6.0. Please use edgar.documents.HTMLParser instead. "
+    "See migration guide: https://edgartools.readthedocs.io/en/latest/migration/"
 )
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
@@ -260,8 +258,8 @@ class LinkBlock(Block):
         self.src = src
         self.inline: bool = True
 
-    def get_text(self) -> str:    
-        return '<{self.tag} alt="{self.alt}" src="{self.src}">'
+    def get_text(self) -> str:
+        return f'<{self.tag} alt="{self.alt}" src="{self.src}">'
 
     def to_markdown(self, prefix_src:str=""):
         return f"![alt  {self.alt}]({prefix_src}/{self.src})\n"
@@ -346,6 +344,7 @@ class HtmlDocument:
                  blocks: List[Block],
                  data: Optional[DocumentData] = None,
                  ):
+        warn_legacy_html_usage(_HTML_DOCUMENTS_DEPRECATION_MSG)
         assert isinstance(blocks, list), "blocks must be a list of Block objects"
         self.blocks: List[Block] = blocks  # The text blocks
         self.data: Optional[DocumentData] = data  # Any data in the document
@@ -456,7 +455,20 @@ class HtmlDocument:
         return ixbrl_document
 
     @classmethod
-    def get_root(cls, html: str) -> Tag:
+    def get_root(cls, html: Union[str, bytes]) -> Tag:
+        # Attachment.download() returns str | bytes. Decode bytes before the
+        # string <TEXT> checks (GH #844); try cp1252 before latin-1 so the SEC's
+        # common non-UTF-8 exhibits decode correctly instead of being mojibaked
+        # by utf-8 + errors="replace".
+        if isinstance(html, (bytes, bytearray)):
+            for enc in ("utf-8", "cp1252"):
+                try:
+                    html = html.decode(enc)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            else:
+                html = html.decode("latin-1")  # 1:1 mapping, never raises
         # First check if the html is inside a <DOCUMENT><TEXT> block
         if "<TEXT>" in html[:500]:
             html = get_text_between_tags(html, 'TEXT')
@@ -596,7 +608,7 @@ def extract_and_format_content(element) -> List[Block]:
         return [
                 LinkBlock(text=str(element),
                           tag=element.name,
-                          element=element.name, 
+                          element=element.name,
                           alt=element.get('alt'),
                           src=element.get('src'),
                           text_type='string')

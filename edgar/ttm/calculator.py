@@ -255,6 +255,19 @@ class TTMCalculator:
                 f"found {len(sorted_facts)} quarters"
             )
 
+        # Detect company FYE month so labels can be derived from period_end without
+        # relying on the as_of_fact's tagged fiscal_year. The SEC tags comparative
+        # facts in next-year filings with the FILING's fiscal_year, so a Q1 2024
+        # fact re-filed as a comparative in 2025 ends up with fy=2025. After
+        # _deduplicate_by_period_end keeps the most recently filed version, the
+        # as_of_fact carries that comparative-shifted fy and produces collided
+        # labels like "Q1 2025" for two distinct windows (GH #793).
+        from edgar.entity.enhanced_statement import (
+            calculate_fiscal_year_for_label,
+            detect_fiscal_year_end,
+        )
+        fiscal_year_end_month = detect_fiscal_year_end(self.facts)
+
         # 4. Calculate only the requested number of TTM windows (from most recent)
         # For YoY growth, we need 4 extra quarters, so calculate a few more if available
         results = []
@@ -277,17 +290,23 @@ class TTMCalculator:
                 if prior_ttm > 0:
                     yoy_growth = (ttm_value - prior_ttm) / prior_ttm
 
-            # Build result row
+            # Build result row. Derive the label fiscal_year from period_end + FYE
+            # rather than trusting as_of_fact.fiscal_year (see GH #793).
             as_of_fact = sorted_facts[i]
+            label_fy = calculate_fiscal_year_for_label(
+                as_of_fact.period_end, fiscal_year_end_month
+            )
             results.append({
-                'as_of_quarter': f"{as_of_fact.fiscal_period} {as_of_fact.fiscal_year}",
+                'as_of_quarter': f"{as_of_fact.fiscal_period} {label_fy}",
                 'ttm_value': ttm_value,
-                'fiscal_year': as_of_fact.fiscal_year,
+                'fiscal_year': label_fy,
                 'fiscal_period': as_of_fact.fiscal_period,
                 'as_of_date': as_of_fact.period_end,  # Add period_end for statement builder
                 'yoy_growth': yoy_growth,
                 'periods_included': [
-                    (q.fiscal_year, q.fiscal_period) for q in ttm_window
+                    (calculate_fiscal_year_for_label(q.period_end, fiscal_year_end_month),
+                     q.fiscal_period)
+                    for q in ttm_window
                 ]
             })
 
@@ -414,16 +433,16 @@ class TTMCalculator:
 
     def _is_additive_concept(self, fact: FinancialFact) -> bool:
         """Check if a fact represents an additive concept (safe for derivation).
-        
+
         Derivation (e.g., Q4 = FY - YTD_9M) relies on the concept being additive over time.
         Non-additive concepts cannot be subtracted to find a period-specific value.
-        
+
         Returns False for:
         - Instant facts (Assets, Equity) - point-in-time, not flows
         - Share counts (UnitType.SHARES) - not additive
         - Ratios/Rates (UnitType.RATIO) - averages, not sums
         - Per-share metrics (EPS) - derived from Income/Shares, shares change
-        
+
         Returns True for:
         - Duration monetary flows (Revenue, Net Income) - truly additive
         """
@@ -558,6 +577,10 @@ class TTMCalculator:
         for ytd6 in ytd_6m:
             if not self._is_additive_concept(ytd6):
                 continue
+            # Skip facts with corrupt/missing fiscal metadata (e.g., proxy
+            # statement historicals tagged with fiscal_period=''). See GH #796.
+            if ytd6.fiscal_period != 'Q2':
+                continue
             q1 = self._find_prior_quarter(quarters, before=ytd6.period_end)
             if q1:
                 q2_value = ytd6.numeric_value - q1.numeric_value
@@ -588,6 +611,10 @@ class TTMCalculator:
         derived = []
         for ytd9 in ytd_9m:
             if not self._is_additive_concept(ytd9):
+                continue
+            # Skip facts with corrupt/missing fiscal metadata (e.g., proxy
+            # statement historicals tagged with fiscal_period=''). See GH #796.
+            if ytd9.fiscal_period != 'Q3':
                 continue
             ytd6 = self._find_prior_ytd6(ytd_6m, before=ytd9.period_end)
             if ytd6:
@@ -628,6 +655,13 @@ class TTMCalculator:
         for fy in annual:
             if not self._is_additive_concept(fy):
                 continue
+            # Skip facts with corrupt/missing fiscal metadata (e.g., proxy
+            # statement historicals tagged with fiscal_period=''). See GH #796:
+            # DX DEF 14A had a 12-month NetIncomeLoss fact with fiscal_year=0,
+            # fiscal_period='' and a wrong scale, which got picked up as the
+            # FY 2025 input and produced Q4 = 319,065 - 133,707,000 = -133M.
+            if fy.fiscal_period != 'FY':
+                continue
             ytd9 = self._find_matching_ytd9(
                 ytd_9m, period_start=fy.period_start, before=fy.period_end
             )
@@ -657,10 +691,17 @@ class TTMCalculator:
                 continue
 
             # Fallback: derive Q4 from FY - (Q1 + Q2 + Q3) when YTD_9M is absent
-            q1_q3_candidates = []
+            # (concept reported as discrete quarters).
+            #
+            # Select the input quarters by their actual calendar period, NOT by the
+            # fiscal_period label. The SEC tags comparative facts in a re-filing with
+            # the FILING's fiscal_period, so the same calendar quarter can appear
+            # labeled Q1, Q2 AND Q3 across successive 10-Qs. Keying on the label then
+            # selects that one quarter for every slot (Q1=Q2=Q3) and yields a wrong,
+            # often negative, Q4 (e.g. GAIN: 57.2M - 3*28.8M = -29.2M). See GH #848;
+            # same root cause as the fiscal_period unreliability behind #793/#796.
+            q_candidates = []
             for q in quarters:
-                if q.fiscal_period not in ("Q1", "Q2", "Q3"):
-                    continue
                 if q.numeric_value is None or q.period_start is None or q.period_end is None:
                     continue
                 if fy.period_start and fy.period_end:
@@ -668,34 +709,36 @@ class TTMCalculator:
                         continue
                     if not (fy.period_start <= q.period_end <= fy.period_end):
                         continue
-                q1_q3_candidates.append(q)
+                q_candidates.append(q)
 
-            if not q1_q3_candidates:
-                log.debug(f"No Q1-Q3 quarters found for FY {fy.fiscal_year} - cannot derive Q4")
+            if not q_candidates:
+                log.debug(f"No discrete quarters found for FY {fy.fiscal_year} - cannot derive Q4")
                 continue
 
-            # Prefer the latest filing per quarter
-            quarter_by_period = {}
-            for q in q1_q3_candidates:
-                existing = quarter_by_period.get(q.fiscal_period)
-                if not existing or (q.filing_date and existing.filing_date and q.filing_date > existing.filing_date):
-                    quarter_by_period[q.fiscal_period] = q
+            # Collapse to one fact per distinct calendar period (latest periodic
+            # filing wins), sorted ascending by period_end.
+            distinct = self._deduplicate_by_period_end(q_candidates)
 
-            ordered_quarters = [quarter_by_period.get(p) for p in ("Q1", "Q2", "Q3")]
-            if any(q is None for q in ordered_quarters):
-                log.debug(f"Incomplete Q1-Q3 set for FY {fy.fiscal_year} - cannot derive Q4")
+            # If a discrete quarter already ends on the fiscal year-end, Q4 is
+            # reported directly - no derivation needed.
+            if any(q.period_end == fy.period_end for q in distinct):
+                log.debug(f"Discrete Q4 already present for FY {fy.fiscal_year} - skipping derivation")
                 continue
 
-            q1, q2, q3 = ordered_quarters
-            if any(q.numeric_value is None for q in (q1, q2, q3)):
-                log.debug(f"Missing numeric values for Q1-Q3 FY {fy.fiscal_year} - cannot derive Q4")
+            # Expect exactly the three quarters (Q1-Q3) that precede Q4. Anything
+            # else (gaps, overlaps, stub periods) is ambiguous - skip rather than
+            # emit a wrong value.
+            if len(distinct) != 3:
+                log.debug(f"Expected 3 discrete quarters for FY {fy.fiscal_year}, "
+                          f"found {len(distinct)} - cannot derive Q4")
                 continue
 
-            q4_value = fy.numeric_value - (q1.numeric_value + q2.numeric_value + q3.numeric_value)
+            q1, q2, q3 = distinct  # ascending by period_end
+            q1_q3_sum = q1.numeric_value + q2.numeric_value + q3.numeric_value
+            q4_value = fy.numeric_value - q1_q3_sum
 
             # Skip if negative and concept should be positive (revenue-like)
             if q4_value < 0 and self._is_positive_concept(fy.concept):
-                q1_q3_sum = q1.numeric_value + q2.numeric_value + q3.numeric_value
                 log.warning(f"Data quality issue: Q1+Q2+Q3 ({q1_q3_sum/1e9:.2f}B) > "
                             f"FY ({fy.numeric_value/1e9:.2f}B) for {fy.concept}, skipping Q4 derivation")
                 continue
@@ -714,7 +757,7 @@ class TTMCalculator:
             derived.append(q4_fact)
             log.debug(
                 f"Derived Q4 from FY: ${q4_value/1e9:.2f}B "
-                f"(FY ${fy.numeric_value/1e9:.2f}B - Q1-3 ${((q1.numeric_value + q2.numeric_value + q3.numeric_value)/1e9):.2f}B)"
+                f"(FY ${fy.numeric_value/1e9:.2f}B - Q1-3 ${q1_q3_sum/1e9:.2f}B)"
             )
         return derived
 
@@ -1052,14 +1095,32 @@ class TTMCalculator:
             calculation_context=derivation_method  # Mark as derived
         )
 
+    # Periodic reports are the canonical source for financials. Facts derived
+    # from these forms are preferred over facts derived from non-periodic forms
+    # (e.g., DEF 14A proxies, S-1 registrations) when both report the same
+    # period. See GH #796 for the failure mode this prevents.
+    _PERIODIC_FORMS = frozenset({
+        '10-K', '10-K/A', '10-KSB', '10-KSB/A',
+        '10-Q', '10-Q/A', '10-QSB', '10-QSB/A',
+        '20-F', '20-F/A', '40-F', '40-F/A', '6-K', '6-K/A',
+    })
+
+    @classmethod
+    def _form_tier(cls, form_type: str) -> int:
+        """Tier ranking for dedup: periodic > everything else."""
+        return 1 if form_type in cls._PERIODIC_FORMS else 0
+
     def _deduplicate_by_period_end(
         self,
         facts: List[FinancialFact]
     ) -> List[FinancialFact]:
-        """Keep latest fact per period_end (handles re-filings).
+        """Keep best fact per period_end (handles re-filings).
 
-        When multiple facts exist for the same period_end (due to amended
-        filings or derivation), keeps the most recently filed version.
+        When multiple facts exist for the same period_end, prefer in this order:
+        1. Facts from periodic reports (10-K, 10-Q, 20-F, etc.) over non-periodic
+           (DEF 14A, S-1, etc.)
+        2. Facts with a more recent filing_date
+        3. Facts with a filing_date over those without
 
         Args:
             facts: List of facts potentially containing duplicates
@@ -1072,16 +1133,18 @@ class TTMCalculator:
             >>> # Returns one fact per unique period_end date
 
         """
-        by_end = {}
+        def sort_key(fact: FinancialFact):
+            # Higher is better. Use a tuple so periodic-report status outranks
+            # filing_date, and filing_date breaks ties within the same tier.
+            return (
+                self._form_tier(fact.form_type or ''),
+                fact.filing_date or date.min,
+            )
+
+        by_end: dict = {}
         for fact in facts:
             key = fact.period_end
-            if key not in by_end:
-                by_end[key] = fact
-            elif fact.filing_date and by_end[key].filing_date and fact.filing_date > by_end[key].filing_date:
-                # Keep the more recently filed version
-                by_end[key] = fact
-            elif fact.filing_date and not by_end[key].filing_date:
-                # Prefer fact with filing_date over one without
+            if key not in by_end or sort_key(fact) > sort_key(by_end[key]):
                 by_end[key] = fact
         return sorted(by_end.values(), key=lambda f: f.period_end)
 

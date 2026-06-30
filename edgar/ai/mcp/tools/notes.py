@@ -122,7 +122,7 @@ async def edgar_notes(
         if not filings or len(filings) == 0:
             return error(
                 f"No {form} filings found for {company}",
-                suggestions=[f"Try form='10-Q' for quarterly", "Use edgar_search to check available filings"]
+                suggestions=["Try form='10-Q' for quarterly", "Use edgar_search to check available filings"]
             )
         filing = filings[0]
     except Exception as e:
@@ -179,7 +179,7 @@ async def edgar_notes(
         if primary.expands_statements:
             stmts = primary.expands_statements
             next_steps.append(
-                f"Use financial_statements to see the {', '.join(stmts)} for {company}"
+                f"Use edgar_company to see the {', '.join(stmts)} for {company}"
             )
         if len(matched) > 1:
             other_titles = [n.title for n in matched[1:3]]
@@ -205,7 +205,7 @@ async def edgar_notes(
         return success(
             result,
             next_steps=[
-                f"Use edgar_notes with topic='debt' (or any note title) to drill into a specific note",
-                f"Use financial_statements for {company} financial data",
+                "Use edgar_notes with topic='debt' (or any note title) to drill into a specific note",
+                f"Use edgar_company with include=['financials'] for {company} financial data",
             ]
         )

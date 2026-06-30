@@ -27,6 +27,52 @@ from edgar.xbrl.core import STANDARD_LABEL, parse_date
 from edgar.xbrl.models import select_display_label
 
 
+def _deduplicate_facts(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Remove true duplicate facts from a DataFrame.
+
+    SEC XBRL instance documents often contain the same fact tagged multiple times
+    (e.g. in the financial statements and again in the notes). This drops rows that
+    are identical on concept, context_ref, value, and decimals — keeping the first
+    occurrence. Rows that share concept+context but differ in value or decimals are
+    preserved, as they represent genuinely different taggings (e.g. precise vs rounded).
+    """
+    dedup_cols = ['concept', 'context_ref', 'value', 'decimals']
+    if all(col in df.columns for col in dedup_cols):
+        df = df.drop_duplicates(subset=dedup_cols, keep='first')
+    return df
+
+
+def _iso4217_code(measure: Optional[str]) -> Optional[str]:
+    """Return the ISO 4217 code of an ``iso4217:`` unit measure, else ``None``."""
+    if measure and measure.startswith('iso4217:'):
+        return measure[len('iso4217:'):]
+    return None
+
+
+def _unit_currency(unit_info: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Resolve a parsed XBRL unit to its ISO 4217 currency code, or ``None``.
+
+    Currency facts use a simple ``iso4217:`` measure (e.g. ``iso4217:HKD`` ->
+    ``HKD``). Per-share monetary facts use a ``divide`` unit whose numerator is
+    the currency (e.g. ``iso4217:USD`` per ``xbrli:shares``), so the numerator
+    currency is returned. Non-monetary units (shares, pure, ...) return ``None``.
+    The opaque ``unit_ref`` id itself (e.g. ``UNIT_STANDARD_HKD_...``) is never
+    parsed -- only the resolved measure is used (see issue #850).
+    """
+    if not unit_info:
+        return None
+    unit_type = unit_info.get('type')
+    if unit_type == 'simple':
+        return _iso4217_code(unit_info.get('measure'))
+    if unit_type == 'divide':
+        for measure in unit_info.get('numerator', []):
+            code = _iso4217_code(measure)
+            if code:
+                return code
+    return None
+
+
 class FactQuery:
     """
     A query builder for XBRL facts that enables filtering by various attributes.
@@ -78,8 +124,8 @@ class FactQuery:
         """
         Filter facts by element label.
 
-        This method searches across different label fields, including both the standardized label 
-        (if standardization was applied) and the original label. This ensures you can query by either 
+        This method searches across different label fields, including both the standardized label
+        (if standardization was applied) and the original label. This ensures you can query by either
         the standardized label or the original company-specific label.
 
         Args:
@@ -211,37 +257,55 @@ class FactQuery:
         return self
 
     def by_date_range(self, start_date: Optional[str] = None,
-                      end_date: Optional[str] = None) -> FactQuery:
+                      end_date: Optional[str] = None,
+                      exact: bool = False) -> FactQuery:
         """
         Filter facts by date range.
 
         Args:
             start_date: Optional start date string in YYYY-MM-DD format
             end_date: Optional end date string in YYYY-MM-DD format
+            exact: If True, match dates exactly (== instead of >=/<= comparisons)
 
         Returns:
             Self for method chaining
         """
         if start_date and end_date:
-            # Match duration facts that fall within the date range
             start_obj = parse_date(start_date)
             end_obj = parse_date(end_date)
-            self._filters.append(lambda f:
-                                 ('period_start' in f and 'period_end' in f and
-                                  parse_date(f['period_start']) >= start_obj and
-                                  parse_date(f['period_end']) <= end_obj))
+            if exact:
+                self._filters.append(lambda f:
+                                     ('period_start' in f and 'period_end' in f and
+                                      parse_date(f['period_start']) == start_obj and
+                                      parse_date(f['period_end']) == end_obj))
+            else:
+                # Match duration facts that fall within the date range
+                self._filters.append(lambda f:
+                                     ('period_start' in f and 'period_end' in f and
+                                      parse_date(f['period_start']) >= start_obj and
+                                      parse_date(f['period_end']) <= end_obj))
         elif start_date:
-            # Match duration facts that start on or after start_date
             start_obj = parse_date(start_date)
-            self._filters.append(lambda f:
-                                 ('period_start' in f and
-                                  parse_date(f['period_start']) >= start_obj))
+            if exact:
+                self._filters.append(lambda f:
+                                     ('period_start' in f and
+                                      parse_date(f['period_start']) == start_obj))
+            else:
+                # Match duration facts that start on or after start_date
+                self._filters.append(lambda f:
+                                     ('period_start' in f and
+                                      parse_date(f['period_start']) >= start_obj))
         elif end_date:
-            # Match duration facts that end on or before end_date
             end_obj = parse_date(end_date)
-            self._filters.append(lambda f:
-                                 ('period_end' in f and
-                                  parse_date(f['period_end']) <= end_obj))
+            if exact:
+                self._filters.append(lambda f:
+                                     ('period_end' in f and
+                                      parse_date(f['period_end']) == end_obj))
+            else:
+                # Match duration facts that end on or before end_date
+                self._filters.append(lambda f:
+                                     ('period_end' in f and
+                                      parse_date(f['period_end']) <= end_obj))
         return self
 
     def by_dimension(self, dimension: Optional[str], value: Optional[str] = None) -> FactQuery:
@@ -251,7 +315,7 @@ class FactQuery:
         This method provides intelligent matching for dimension names and values, handling
         common XBRL formatting variations including:
         - Namespace prefixes (us-gaap:, srt:, etc.)
-        - Underscore vs colon separators  
+        - Underscore vs colon separators
         - Partial dimension names
 
         Args:
@@ -264,7 +328,7 @@ class FactQuery:
         Examples:
             # These are all equivalent:
             .by_dimension("srt_ProductOrServiceAxis", "us-gaap:ServiceMember")
-            .by_dimension("srt:ProductOrServiceAxis", "us-gaap_ServiceMember") 
+            .by_dimension("srt:ProductOrServiceAxis", "us-gaap_ServiceMember")
             .by_dimension("ProductOrServiceAxis", "ServiceMember")
         """
         if dimension is None:
@@ -810,6 +874,7 @@ class FactQuery:
             return pd.DataFrame()
 
         df = pd.DataFrame(results)
+        df = _deduplicate_facts(df)
 
         # GH-607: When a specific dimension was requested via by_dimension(),
         # update dimension fields to reflect that dimension's member info
@@ -970,6 +1035,10 @@ class FactsView:
         # Build enriched facts from raw facts, contexts, and elements
         enriched_facts = []
 
+        # Resolve each fact's opaque unit_ref to its ISO 4217 currency once
+        # (e.g. "UNIT_STANDARD_HKD_..." -> "HKD"); see issue #850.
+        units = self.xbrl.units
+
         for fact_key, fact in self.xbrl._facts.items():
             # Create a dict with only necessary fields instead of full model_dump
             fact_dict = {
@@ -979,6 +1048,7 @@ class FactsView:
                 'context_ref': fact.context_ref,
                 'value': fact.value,
                 'unit_ref': fact.unit_ref,
+                'currency': _unit_currency(units.get(fact.unit_ref)) if fact.unit_ref else None,
                 'decimals': fact.decimals,
                 'numeric_value': fact.numeric_value
             }
@@ -1229,6 +1299,7 @@ class FactsView:
 
         facts = self.get_facts()
         df = pd.DataFrame(facts)
+        df = _deduplicate_facts(df)
         self._facts_df_cache = df
         return df
 

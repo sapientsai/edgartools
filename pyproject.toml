@@ -56,7 +56,10 @@ dependencies = [
   "nest-asyncio>=1.5.1",
   "jinja2>=3.1.0",
   "pyrate-limiter>=3.0.0",
-  "httpxthrottlecache>=0.3.0",
+  # Cap below 0.5.0: that release migrated from httpx to the httpx2 fork, which
+  # breaks edgartools (we import plain httpx throughout httprequests.py and our
+  # tests mock httpx). 0.3.5 is the latest version still on plain httpx.
+  "httpxthrottlecache>=0.3.0,<0.5.0",
   "truststore>=0.9.0",
 ]
 dynamic = ["version"]
@@ -150,7 +153,11 @@ dependencies = [
   "pytest-asyncio",
   "pytest-retry",
   "pytest-vcr",
-  "vcrpy",
+  # Pin <8.2: vcrpy 8.2.0 reintroduced an httpx stub whose response
+  # deserializer crashes (`'NoneType' object has no attribute 'encode'`)
+  # on cassettes with a null reason phrase (e.g. SEC S3 404 responses).
+  # 8.1.1 intercepts httpx via httpcore_stubs.py and replays correctly.
+  "vcrpy<8.2",
   "filelock",
   "pyinstrument",
   "pyright",
@@ -235,6 +242,9 @@ omit = [
   "edgar/**/examples.py",
   "edgar/**/examples/*.py",
   "edgar/display/demo.py",
+  "edgar/thirteenf/demo_comparison.py",
+  # __main__-only data download stubs (not library code)
+  "edgar/reference/financials.py",
   # Training scripts (ML training utilities, not runtime code)
   "edgar/entity/training/*",
   # Migration utilities (one-time migration helpers)
@@ -321,6 +331,8 @@ markers = [
     "integration: Integration tests",
     "data_quality: Data quality validation tests",
     "vcr: Tests using VCR cassettes for recorded HTTP responses",
+    "manual: Manual-only tests, excluded from CI (slow evaluations, benchmarks)",
+    "viewer_corpus: SEC R*.htm viewer verification corpus (beads edgartools-doup)",
 ]
 
 [tool.pyright]

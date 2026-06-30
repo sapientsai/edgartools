@@ -187,7 +187,7 @@ class Financials:
 
             # Filter out abstract rows - they never have values
             if 'abstract' in df.columns:
-                df = df[df['abstract'] == False].copy()
+                df = df[~df['abstract']].copy()
 
             # Get period columns
             period_columns = [col for col in df.columns
@@ -198,16 +198,38 @@ class Financials:
 
             period_col = period_columns[period_offset]
 
+            def _strip_ns(name: str) -> str:
+                # Normalize a concept name to its bare local-name for exact comparison.
+                # Strips the standard taxonomy namespaces edgartools maps against
+                # (us-gaap, dei, ifrs-full). Company-specific prefixes are left
+                # intact on both sides of the comparison and still match exactly.
+                return (str(name)
+                        .replace('us-gaap_', '')
+                        .replace('us-gaap:', '')
+                        .replace('dei_', '')
+                        .replace('dei:', '')
+                        .replace('ifrs-full_', '')
+                        .replace('ifrs-full:', ''))
+
+            concept_local = df['concept'].astype(str).map(_strip_ns).str.lower()
+
             # Try each standard concept name in order
             for std_concept_name in standard_concept_names:
-                # Get all XBRL concepts that map to this standard concept
-                xbrl_concepts = standardizer.mappings.get(std_concept_name, [])
+                # Get all XBRL concepts that map to this standard concept.
+                # The standardizer stores these as a set, so we sort to make
+                # iteration order deterministic across runs (otherwise a filer
+                # whose statement contains multiple mapped concepts can return
+                # different values depending on Python hash randomization).
+                xbrl_concepts = sorted(standardizer.mappings.get(std_concept_name, []))
 
                 # Search for any of these concepts in the dataframe
                 for xbrl_concept in xbrl_concepts:
-                    # Match the concept name (handle both full name and base name)
-                    concept_pattern = xbrl_concept.replace('us-gaap_', '').replace('dei_', '')
-                    matches = df[df['concept'].str.contains(concept_pattern, case=False, na=False, regex=False)]
+                    # Exact local-name match (case-insensitive). Substring matching
+                    # is unsafe here: e.g. 'NetIncome' substring-matches the
+                    # NetIncomeLossAttributableToNoncontrollingInterest row and
+                    # produces wrong values (Issue #814).
+                    target = _strip_ns(xbrl_concept).lower()
+                    matches = df[concept_local == target]
 
                     if not matches.empty:
                         # Try each match until we find one with a valid value
@@ -269,7 +291,7 @@ class Financials:
 
             # Filter out abstract rows - they never have values
             if 'abstract' in df.columns:
-                df = df[df['abstract'] == False].copy()
+                df = df[~df['abstract']].copy()
 
             # Find the concept using pattern matching
             for pattern in concept_patterns:
@@ -344,7 +366,11 @@ class Financials:
 
     def get_net_income(self, period_offset: int = 0) -> Optional[Union[int, float]]:
         """
-        Get net income from the income statement using standardized labels.
+        Get net income from the income statement using standardized XBRL concepts.
+
+        Concept-based lookup runs first so the canonical
+        ``us-gaap:NetIncomeLoss`` is preferred over rows that happen to be
+        labeled "Net income ..." (e.g. noncontrolling-interest lines).
 
         Args:
             period_offset: Which period to get (0=most recent, 1=previous, etc.)
@@ -353,17 +379,40 @@ class Financials:
             Net income value if found, None otherwise
 
         Example:
-            >>> company = Company('AAPL')  
+            >>> company = Company('AAPL')
             >>> financials = company.get_financials()
             >>> net_income = financials.get_net_income()
         """
+        # First try concept-based search using standardization mappings.
+        # 'Net Income' covers us-gaap_NetIncome / us-gaap_NetIncomeLoss (the
+        # parent-attributable line for US GAAP filers reporting NCI).
+        # 'Profit or Loss' covers us-gaap_ProfitLoss and the IFRS variants
+        # (ifrs-full_ProfitLoss, ifrs-full_ProfitLossAttributableToOwnersOfParent)
+        # used by 20-F filers — these would otherwise miss when the row label
+        # is not "Net income" (e.g. "Profit after tax").
+        result = self._get_standardized_concept_by_xbrl(
+            'income',
+            ['Net Income', 'Profit or Loss'],
+            period_offset
+        )
+        if result is not None:
+            return result
+
+        # Fallback to label-based search for filers whose concept isn't in
+        # the standardization map. Includes 'Net Loss' variants (filer reporting
+        # a loss labels the row "Net loss attributable to ...") and 'Profit/Loss'
+        # for IFRS labels like "Profit (loss) for the year". All patterns
+        # explicitly exclude "noncontrolling" so we don't pick the NCI row.
         patterns = [
-            r'Net Income$',                    # Exact match
-            r'^Net Income',                    # Starts with
-            r'Net Income.*Common',             # Net income attributable to common
-            r'Net Income.*Shareholders',       # Net income attributable to shareholders  
-            r'Profit.*Loss',                   # International variations
-            r'Net Earnings'                    # Alternative terminology
+            r'Net Income$',
+            r'^Net Income(?!.*[Nn]oncontrolling)',
+            r'^Net Loss(?!.*[Nn]oncontrolling)',
+            r'Net Income.*Common',
+            r'Net Income.*Shareholders',
+            r'Net Loss.*Common',
+            r'Net Loss.*Shareholders',
+            r'Net Earnings',
+            r'Profit.*Loss(?!.*[Nn]oncontrolling)',
         ]
         return self._get_standardized_concept_value('income', patterns, period_offset)
 
@@ -412,13 +461,13 @@ class Financials:
 
         Example:
             >>> company = Company('AAPL')
-            >>> financials = company.get_financials()  
+            >>> financials = company.get_financials()
             >>> total_assets = financials.get_total_assets()
         """
         patterns = [
             r'Total Assets$',      # Exact match
             r'^Total Assets',      # Starts with
-            r'Assets$'             # Just "Assets" 
+            r'Assets$'             # Just "Assets"
         ]
         return self._get_standardized_concept_value('balance', patterns, period_offset)
 
@@ -497,7 +546,7 @@ class Financials:
 
     def get_capital_expenditures(self, period_offset: int = 0) -> Optional[Union[int, float]]:
         """
-        Get capital expenditures from the cash flow statement using standardized labels.
+        Get capital expenditures from the cash flow statement using standardized XBRL concepts.
 
         Args:
             period_offset: Which period to get (0=most recent, 1=previous, etc.)
@@ -505,12 +554,20 @@ class Financials:
         Returns:
             Capital expenditures value if found, None otherwise
         """
+        # First try concept-based search using standardization mappings
+        result = self._get_standardized_concept_by_xbrl(
+            'cashflow',
+            ['Payments for Property, Plant and Equipment'],
+            period_offset
+        )
+
+        if result is not None:
+            return result
+
+        # Fallback to label-based search for edge cases
         patterns = [
             r'Capital Expenditures',
             r'Additions.*property.*equipment',  # MSFT: "Additions to property and equipment"
-            r'Property.*Plant.*Equipment',
-            r'Payments.*Property',
-            r'Acquisitions.*Property',
             r'Purchase.*Property',
             r'Capex'
         ]
@@ -703,7 +760,7 @@ class Financials:
         metrics['operating_income'] = self.get_operating_income()
         metrics['net_income'] = self.get_net_income()
 
-        # Balance Sheet Metrics  
+        # Balance Sheet Metrics
         metrics['total_assets'] = self.get_total_assets()
         metrics['total_liabilities'] = self.get_total_liabilities()
         metrics['stockholders_equity'] = self.get_stockholders_equity()
@@ -730,7 +787,7 @@ class Financials:
 
         if metrics['total_liabilities'] and metrics['total_assets']:
             try:
-                metrics['debt_to_assets'] = metrics['total_liabilities'] / metrics['total_assets'] 
+                metrics['debt_to_assets'] = metrics['total_liabilities'] / metrics['total_assets']
             except (TypeError, ZeroDivisionError):
                 metrics['debt_to_assets'] = None
         else:

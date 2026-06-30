@@ -33,6 +33,11 @@ def test_thirteenf_from_filing_with_multiple_related_filing_on_same_day():
     print()
     print(thirteenF)
     assert thirteenF.total_holdings == 6
+    # This filing (MetLife Investment Mgmt, filed 2023-03-23 for period 2021-12-31) reports
+    # values in WHOLE DOLLARS despite its pre-cutover period -- a late filing using the new
+    # convention. Per-filing unit detection (edgartools-mun2) leaves it unscaled; the old
+    # date-cutoff rule wrongly multiplied it by 1000. Implied ETF prices (SPY ~$430, etc.)
+    # confirm dollars.
     assert thirteenF.total_value == Decimal('11019796')
 
     assert thirteenF.primary_form_information.signature.name == 'Steven Goulart'
@@ -86,6 +91,7 @@ def test_thirteenf_holdings():
     print()
     thirteenF = ThirteenF(MetLife13F)
     assert thirteenF.total_holdings == 6
+    # Whole-dollars filing; not scaled by per-filing unit detection (edgartools-mun2).
     assert thirteenF.total_value == Decimal('11019796')
     assert thirteenF.primary_form_information.signature.name == 'Steven Goulart'
 
@@ -603,6 +609,7 @@ def test_manager_properties_integration_with_existing_code():
     
     # New properties should not interfere with existing functionality
     assert thirteenF.total_holdings == 6
+    # Whole-dollars filing; not scaled by per-filing unit detection (edgartools-mun2).
     assert thirteenF.total_value == Decimal('11019796')
     assert thirteenF.has_infotable()
     

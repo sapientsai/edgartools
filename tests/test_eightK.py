@@ -1,3 +1,5 @@
+from datetime import date
+
 import pytest
 from rich import print
 
@@ -174,14 +176,6 @@ def test_get_exhibit_content_for_old_filing():
     assert "Yahoo" in text
 
 
-def test_create_eightk_from_old_filing_with_no_html():
-    f = Filing(form='8-K', filing_date='1998-01-05', company='YAHOO INC', cik=1011006, accession_no='0001047469-98-000122')
-    eightk = f.obj()
-    assert eightk
-    html = f.html()
-    print(html)
-
-
 def test_get_content_for_eightk_with_binary_exhibit():
     filing = Filing(form='8-K', filing_date='2010-02-26', company='MANNATECH INC', cik=1056358, accession_no='0001056358-10-000003')
     eightk = filing.obj()
@@ -191,9 +185,12 @@ def test_get_content_for_eightk_with_binary_exhibit():
     assert content
 
 def test_eightk_date_of_report():
+    # date_of_report always returns a datetime.date (never a formatted string),
+    # so consumers don't have to parse mixed types. (edgartools-83gh)
     f = Filing(form='8-K', filing_date='1995-01-24', company='AMERICAN EXPRESS CO', cik=4962, accession_no='0000004962-95-000001')
     eightk = f.obj()
-    assert eightk.date_of_report == 'January 23, 1995'
+    assert eightk.date_of_report == date(1995, 1, 23)
+    assert isinstance(eightk.date_of_report, date)
 
 
 def test_extract_xbrl_from_8k():

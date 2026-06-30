@@ -182,7 +182,7 @@ def set_identity(user_identity: str):
     log.info("Identity of the Edgar REST client set to [%s]", user_identity)
 
     from edgar.httpclient import close_clients
-    close_clients() # close any httpx clients, to reset the identity. 
+    close_clients() # close any httpx clients, to reset the identity.
 
 
 identity_prompt = """
@@ -194,8 +194,8 @@ See https://www.sec.gov/os/accessing-edgar-data
 
 This can be set in the environment variable [bold green]EDGAR_IDENTITY[/bold green].
 
-1. Set an OS environment variable 
-    [bold]EDGAR_IDENTITY=[green]Name email@domain.com[/green][/bold] 
+1. Set an OS environment variable
+    [bold]EDGAR_IDENTITY=[green]Name email@domain.com[/green][/bold]
 2. Or a Python environment variable
     import os
     [bold]os.environ['EDGAR_IDENTITY']=[green]"Name email@domain.com"[/green][/bold]
@@ -252,7 +252,7 @@ def decode_content(content: bytes):
 
 text_extensions = (".txt", ".htm", ".html", ".xsd", ".xml", "XML", ".json", ".idx", ".paper")
 binary_extensions = (".pdf", ".jpg", ".jpeg", "png", ".gif", ".tif", ".tiff", ".bmp", ".ico", ".svg", ".webp", ".avif",
-                     ".apng")
+                     ".apng", ".xlsx", ".xls", ".zip", ".docx", ".pptx")
 
 
 def get_bool(value: Optional[str] = None) -> Optional[bool]:
@@ -396,7 +396,7 @@ def decode_content(content: bytes):
 
 text_extensions = (".txt", ".htm", ".html", ".xsd", ".xml", "XML", ".json", ".idx", ".paper")
 binary_extensions = (".pdf", ".jpg", ".jpeg", "png", ".gif", ".tif", ".tiff", ".bmp", ".ico", ".svg", ".webp", ".avif",
-                     ".apng")
+                     ".apng", ".xlsx", ".xls", ".zip", ".docx", ".pptx")
 
 
 class DataPager:
@@ -633,8 +633,8 @@ def has_html_content(content: str) -> bool:
 T = TypeVar('T')
 R = TypeVar('R')
 
-def parallel_thread_map(func: Callable[[T], R], 
-                        items: Iterable[T], 
+def parallel_thread_map(func: Callable[[T], R],
+                        items: Iterable[T],
                         **kwargs) -> List[R]:
     """
     Run a function in parallel across multiple items using ThreadPoolExecutor.
@@ -676,13 +676,20 @@ def initialize_rich_logging():
         handlers=[RichHandler(rich_tracebacks=True)]
     )
 
-    # Turn down 3rd party logging
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpxthrottlecache").setLevel(logging.WARNING)
-    logging.getLogger("pyrate_limiter").setLevel(
-        logging.CRITICAL
-    )  # TODO: Temporary, until next pyrate_limiter update that reduces the spurious "async" message
+    # Third-party loggers already suppressed at module level
 
+
+# Suppress noisy third-party loggers by default.
+# Users can override after import: logging.getLogger("httpx").setLevel(logging.DEBUG)
+_NOISY_LOGGERS = {
+    "httpx": logging.WARNING,
+    "httpxthrottlecache": logging.WARNING,
+    "pyrate_limiter": logging.CRITICAL,  # Emits spurious "async" messages at WARNING
+}
+for _logger_name, _level in _NOISY_LOGGERS.items():
+    _lg = logging.getLogger(_logger_name)
+    if _lg.level == logging.NOTSET:  # Only set if user hasn't already configured
+        _lg.setLevel(_level)
 
 # Turn on rich logging if the environment variable is set
 if os.getenv('EDGAR_USE_RICH_LOGGING', '0') == '1':

@@ -9,6 +9,7 @@ values verified by hand against the SEC EDGAR filing.
 """
 import pytest
 from edgar import find
+from edgar._filings import Filing
 from edgar.offerings.prospectus import (
     Prospectus424B,
     ShelfLifecycle,
@@ -122,7 +123,11 @@ class TestOfferingTypeClassification:
 
     @pytest.mark.vcr
     def test_nextera_atm(self):
-        filing = find("0001193125-25-338333")
+        # Construct the Filing directly rather than find() — find() downloads the
+        # whole quarterly full-index to resolve one accession, which bloats the
+        # cassette ~30x (edgartools-9q82 cassette cleanup).
+        filing = Filing(form='424B5', company='NEXTERA ENERGY INC', cik=753308,
+                        filing_date='2025-12-31', accession_no='0001193125-25-338333')
         p = Prospectus424B.from_filing(filing)
         assert p.offering_type == OfferingType.ATM
 
@@ -473,13 +478,18 @@ class TestShelfLifecycle:
 
     @pytest.mark.vcr
     def test_alzamend_shelf_expires(self):
-        """Shelf expires 3 years after filing."""
+        """Shelf expires 3 years after effectiveness (Rule 415(a)(5)).
+
+        Single-generation shelf: S-3 filed 2023-08-02, EFFECT 2023-08-10.
+        Expiry anchors on effectiveness (2023-08-10 + 3y), not the filing date
+        (edgartools-fu3x).
+        """
         from datetime import date
         filing = find("0001214659-26-002941")
         p = Prospectus424B.from_filing(filing)
         lc = p.lifecycle
         assert lc is not None
-        assert lc.shelf_expires == date(2026, 8, 2)
+        assert lc.shelf_expires == date(2026, 8, 10)
 
     @pytest.mark.vcr
     def test_alzamend_cadence(self):
@@ -771,3 +781,50 @@ class TestDeal:
         text = str(p.deal)
         assert "Deal" in text
         assert "Traws Pharma" in text or "company=" in text
+
+
+class TestDilutionDollarPrefix:
+    """extract_dilution_data must not double-prefix '$'.
+
+    A dilution table renders the per-share figures either with a separate '$'
+    spacer cell ('$' | '5.10') or with the sign embedded in the value cell
+    ('$5.10'). The value cell is numeric in both shapes, so the embedded form
+    used to become '$$5.10' — the same value source the pricing path already
+    guards with _prefix_dollar.
+    """
+
+    @staticmethod
+    def _table(rows):
+        from types import SimpleNamespace
+        from edgar.documents.table_nodes import Cell, Row
+        return SimpleNamespace(rows=[
+            Row(cells=[Cell(content=c) for c in cells]) for cells in rows
+        ])
+
+    def test_embedded_dollar_not_doubled(self):
+        from edgar.offerings._424b_tables import extract_dilution_data
+        table = self._table([
+            ['Public offering price per share', '$5.10'],
+            ['Dilution per share to new investors', '$3.50'],
+        ])
+        dd = extract_dilution_data(table)
+        assert dd.public_offering_price == '$5.10'
+        assert dd.dilution_per_share == '$3.50'
+
+    def test_spacer_dollar_cell_still_prefixed(self):
+        from edgar.offerings._424b_tables import extract_dilution_data
+        table = self._table([
+            ['Public offering price per share', '$', '5.10'],
+            ['Dilution per share to new investors', '$', '3.50'],
+        ])
+        dd = extract_dilution_data(table)
+        assert dd.public_offering_price == '$5.10'
+        assert dd.dilution_per_share == '$3.50'
+
+    def test_negative_value_left_in_parens(self):
+        from edgar.offerings._424b_tables import extract_dilution_data
+        table = self._table([
+            ['Net tangible book value before the offering', '(0.34)'],
+        ])
+        dd = extract_dilution_data(table)
+        assert dd.ntbv_before_offering == '(0.34)'

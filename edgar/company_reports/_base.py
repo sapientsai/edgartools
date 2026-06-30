@@ -4,6 +4,7 @@ from functools import cached_property
 from typing import List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from edgar.search.grep import GrepResult
     from edgar.sgml.filing_summary import Reports
 
 from rich import print
@@ -76,6 +77,26 @@ class CompanyReport:
         except Exception as e:
             log.debug(f"Could not load FilingSummary for notes hierarchy: {e}")
         return Notes.from_xbrl(xbrl, filing_summary=filing_summary)
+
+    def grep(self, pattern: str, *, regex: bool = False, document: Optional[str] = None) -> 'GrepResult':
+        """
+        Grep for exact text matches across the filing.
+
+        Delegates to the underlying Filing.grep(). Case-insensitive.
+
+        Args:
+            pattern: Text to search for
+            regex: If True, treat pattern as a regular expression
+            document: Narrow to specific document ("primary", "EX-10.1", etc.)
+
+        Returns:
+            GrepResult with matches
+
+        Examples:
+            >>> tenk.grep("going concern")
+            >>> tenk.grep("Level 3", document="primary")
+        """
+        return self._filing.grep(pattern, regex=regex, document=document)
 
     @cached_property
     def reports(self) -> Optional['Reports']:
@@ -166,6 +187,22 @@ class CompanyReport:
                     items.append(f"Item {item_num}")
         return items
 
+    @property
+    def signatures(self) -> Optional[str]:
+        """The Signatures section text, if present.
+
+        Signatures is a *named* (non-Item) section, so it does not appear in
+        :attr:`items`; this is its convenience accessor, parallel to the Item
+        properties (``.business``, ``.risk_factors``, ...). Returns ``None`` when
+        the filing exposes no detectable Signatures section.
+
+        Examples:
+            >>> tenk.signatures[:60]
+            'Pursuant to the requirements of Section 13 or 15(d) ...'
+        """
+        section = self.document.sections.named("signatures")
+        return section.text() if section else None
+
     def __getitem__(self, item_or_part: str):
         """
         Get item or part text from the filing.
@@ -203,9 +240,15 @@ class CompanyReport:
         """Generate cross-cutting context for specific topic(s).
 
         Pulls statement line items, note content, and policies together.
+
+        Args:
+            focus: Topic or list of topics
+            detail: 'minimal', 'standard', or 'full'
         """
         if isinstance(focus, str):
             focus = [focus]
+
+        notes = self.notes
 
         form_label = self.form or 'Filing'
         lines = []
@@ -220,7 +263,6 @@ class CompanyReport:
             pass
         lines.append("")
 
-        notes = self.notes
         if not notes:
             lines.append("(No notes available)")
             return "\n".join(lines)

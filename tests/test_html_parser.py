@@ -12,6 +12,7 @@ from edgar.documents.types import TableType
 from edgar.documents.exceptions import HTMLParsingError, DocumentTooLargeError
 from edgar.documents.nodes import HeadingNode, ParagraphNode, TextNode
 from edgar.documents.table_nodes import TableNode
+from edgar.documents.processors.preprocessor import HTMLPreprocessor
 
 
 class TestBasicParsing:
@@ -51,6 +52,118 @@ class TestBasicParsing:
         
         assert "Unclosed paragraph" in doc.text()
         assert "Nested" in doc.text()
+
+    def test_document_statistics_are_lazy_and_cached(self, monkeypatch):
+        """Statistics should preserve their API without rendering text during parsing."""
+        from dataclasses import asdict
+
+        text_calls = 0
+        original_text = Document.text
+
+        def counting_text(document, *args, **kwargs):
+            nonlocal text_calls
+            text_calls += 1
+            return original_text(document, *args, **kwargs)
+
+        monkeypatch.setattr(Document, "text", counting_text)
+
+        doc = parse_html("<html><body><h1>Title</h1><p>Hello World</p></body></html>")
+        assert text_calls == 0
+        assert "_statistics" not in asdict(doc.metadata)
+
+        statistics = doc.metadata.statistics
+        assert text_calls == 1
+        assert statistics == {
+            "node_count": sum(1 for _ in doc.root.walk()),
+            "text_length": len("Title\n\nHello World"),
+            "table_count": 0,
+            "heading_count": 1,
+        }
+
+        assert doc.metadata.statistics is statistics
+        assert text_calls == 1
+
+    def test_statistics_are_available_from_detached_metadata(self):
+        """Metadata should retain exact statistics until their first access."""
+        import gc
+        from weakref import ref
+
+        doc = parse_html("<html><body><p>Hello World</p></body></html>")
+        metadata = doc.metadata
+        document_ref = ref(doc)
+        expected_node_count = sum(1 for _ in doc.root.walk())
+
+        del doc
+        gc.collect()
+
+        assert document_ref() is not None
+        assert metadata.statistics == {
+            "node_count": expected_node_count,
+            "text_length": len("Hello World"),
+            "table_count": 0,
+            "heading_count": 0,
+        }
+
+        gc.collect()
+        assert document_ref() is None
+
+    def test_unaccessed_statistics_do_not_leak_discarded_document(self):
+        """A discarded document cycle should remain garbage-collectable."""
+        import gc
+        from weakref import ref
+
+        doc = parse_html("<html><body><p>Discarded</p></body></html>")
+        document_ref = ref(doc)
+
+        del doc
+        gc.collect()
+
+        assert document_ref() is None
+
+    def test_document_and_metadata_are_pickleable_before_statistics_access(self):
+        """Deferred statistics should preserve document serialization behavior."""
+        import pickle
+
+        doc = parse_html("<html><body><h1>Title</h1><p>Hello World</p></body></html>")
+        # The payload is created locally in the same expression; no untrusted
+        # data reaches this compatibility round-trip.
+        metadata = pickle.loads(pickle.dumps(doc.metadata))  # nosec B301
+
+        assert metadata.statistics == {
+            "node_count": sum(1 for _ in doc.root.walk()),
+            "text_length": len("Title\n\nHello World"),
+            "table_count": 0,
+            "heading_count": 1,
+        }
+
+        restored_document = pickle.loads(  # nosec B301 - trusted local payload
+            pickle.dumps(
+                parse_html("<html><body><p>Serializable</p></body></html>")
+            )
+        )
+        assert restored_document.metadata.statistics["text_length"] == len("Serializable")
+
+    def test_statistics_loader_is_retried_after_failure(self):
+        """A failed deferred calculation should remain available for retry."""
+        from edgar.documents.document import DocumentMetadata
+
+        metadata = DocumentMetadata()
+        attempts = 0
+
+        def calculate_statistics():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("temporary failure")
+            return {"node_count": 1}
+
+        metadata._set_statistics_loader(calculate_statistics)
+
+        with pytest.raises(RuntimeError, match="temporary failure"):
+            _ = metadata.statistics
+
+        assert metadata.statistics == {"node_count": 1}
+        assert attempts == 2
 
 
 class TestNodeTypes:
@@ -187,6 +300,33 @@ class TestTableParsing:
         
         # Should handle nested tables appropriately
         assert len(doc.tables) >= 1
+
+
+class TestPreprocessing:
+    """Test HTML cleanup before document construction."""
+
+    def test_excessive_newlines_are_collapsed(self):
+        preprocessor = HTMLPreprocessor(ParserConfig())
+
+        result = preprocessor._normalize_whitespace("alpha\n\nbeta\n\n\n\ngamma")
+
+        assert result == "alpha\n\nbeta\n\ngamma"
+
+    def test_three_or_more_line_breaks_are_collapsed(self):
+        preprocessor = HTMLPreprocessor(ParserConfig())
+
+        result = preprocessor._fix_common_issues(
+            "alpha<BR > \n<br/> <br> <Br /> \n beta"
+        )
+
+        assert result == "alpha<br/><br/>beta"
+
+    def test_missing_sentence_spacing_is_normalized_without_changing_abbreviations(self):
+        preprocessor = HTMLPreprocessor(ParserConfig())
+
+        result = preprocessor._fix_common_issues("Alpha.One Beta?Two U.S.Code")
+
+        assert result == "Alpha. One Beta? Two U.S.Code"
 
 
 class TestTextExtraction:
@@ -366,77 +506,30 @@ class TestPerformance:
         with pytest.raises(DocumentTooLargeError):
             parse_html(large_html, config)
     
-    def test_streaming_parser(self):
-        """Test streaming parser for large documents."""
-        # Note: The streaming parser implementation has issues with iterparse
-        # that need to be fixed. For now, we'll test that streaming mode
-        # can be triggered without errors, even if the output is not complete.
+    def test_document_over_old_streaming_threshold_extracts_content(self):
+        """Documents over the former streaming_threshold parse via the one pipeline.
+
+        streaming_threshold used to route anything above it to a separate
+        StreamingParser with divergent, lossy text output (edgartools-tlj1).
+        That parser was removed; the setting is now ignored. This pins that a
+        document above the configured threshold still yields full content.
+        """
         config = ParserConfig(
-            streaming_threshold=1000,  # Use streaming for docs > 1KB
-            max_document_size=20000  # Increased to 20KB
+            streaming_threshold=1000,
+            max_document_size=20000
         )
-        
-        # Create moderately large HTML (should be > streaming_threshold)
+
         html = "<html><body>"
         for i in range(100):
             html += f"<p>Paragraph {i} with some content.</p>"
         html += "</body></html>"
-        
-        # Verify it's large enough to trigger streaming
+
         assert len(html.encode('utf-8')) > config.streaming_threshold
-        
-        # For now, just test that parsing doesn't raise an exception
+
         doc = parse_html(html, config)
-        assert doc is not None
-        
-        # TODO: Fix streaming parser to properly extract content
-        # The streaming parser currently has issues with iterparse
-        # clearing elements before text can be extracted
-
-    def test_streaming_parser_size_check_uses_input_bytes(self):
-        """``StreamingParser.parse`` must size-check against input bytes.
-
-        Regression pin. Before commit 6b702bd9 the streaming loop
-        accumulated ``len(etree.tostring(elem))`` on every iteration,
-        which re-serialized nested subtrees and could falsely reject
-        documents whose actual size was within the configured limit.
-        That commit deferred the accounting around table subtrees but
-        kept the per-event accumulator otherwise — leaving the size
-        check coupled to lxml internals (sibling-pruning order, tail
-        attribution) instead of the input.
-
-        This test calls ``StreamingParser`` directly to bypass the
-        upstream ``HTMLParser._parse`` size guard and pins the
-        invariant: parsing succeeds when actual input size is within
-        ``max_document_size`` and raises ``DocumentTooLargeError``
-        only when it isn't, regardless of how the document is nested.
-        """
-        from edgar.documents.utils.streaming import StreamingParser
-
-        # Deeply-nested inline soup mirrors SEC inline-XBRL filings.
-        inner = "<p><b><i><u><em><strong>x</strong></em></u></i></b></p>"
-        rows = "".join(inner for _ in range(2000))
-        html = f"<html><body>{rows}</body></html>"
-        actual_size = len(html.encode("utf-8"))
-
-        # Cap just above actual size — accounting that reports more
-        # than actual bytes would falsely raise here.
-        config = ParserConfig(
-            streaming_threshold=actual_size // 2,
-            max_document_size=actual_size + 1024,
-        )
-        parser = StreamingParser(config, strategies={})
-        doc = parser.parse(html)
-        assert doc is not None
-
-        # Cap below actual size must still raise.
-        too_small = ParserConfig(
-            streaming_threshold=actual_size // 2,
-            max_document_size=actual_size // 2,
-        )
-        parser_small = StreamingParser(too_small, strategies={})
-        with pytest.raises(DocumentTooLargeError):
-            parser_small.parse(html)
+        text = doc.text()
+        assert "Paragraph 0 with some content." in text
+        assert "Paragraph 99 with some content." in text
 
 
 class TestXBRLExtraction:

@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from edgar.config import VERBOSE_EXCEPTIONS
 from edgar.core import log
-from edgar.xbrl.exceptions import StatementNotFound
+from edgar.exceptions import StatementNotFoundError
 from edgar.xbrl.statements import statement_to_concepts
 
 
@@ -429,15 +429,30 @@ ESSENTIAL_CONCEPTS = {
         ]
     },
     "CashFlowStatement": {
+        # IFRS filers do not all use CashFlowsFromUsedInOperatingActivities for
+        # the operating total. IAS 7 permits presenting "cash flows from
+        # operations" as the subtotal before interest and tax, which is a
+        # separate element (CashFlowsFromUsedInOperations); a filer using it
+        # often carries the operating TOTAL in a company extension, which no
+        # list of standard concepts can anticipate. Vale S.A. is the case that
+        # exposed this: its 20-F cash flow role satisfied neither group below,
+        # so validation rejected the one role in the filing typed
+        # CashFlowStatement and find_statement raised "No statements
+        # available" — for a statement that was there all along
+        # (edgartools-gi1n).
         "operating": [
             "us-gaap_NetCashProvidedByUsedInOperatingActivities",
             "us-gaap_NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
-            "ifrs-full_CashFlowsFromUsedInOperatingActivities"
+            "ifrs-full_CashFlowsFromUsedInOperatingActivities",
+            "ifrs-full_CashFlowsFromUsedInOperations"
         ],
+        # Likewise the change in cash: filers that show the effect of exchange
+        # rate changes as a separate line report the subtotal before it.
         "cash_change": [
             "us-gaap_CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsPeriodIncreaseDecreaseIncludingExchangeRateEffect",
             "us-gaap_CashAndCashEquivalentsPeriodIncreaseDecrease",
-            "ifrs-full_IncreaseDecreaseInCashAndCashEquivalents"
+            "ifrs-full_IncreaseDecreaseInCashAndCashEquivalents",
+            "ifrs-full_IncreaseDecreaseInCashAndCashEquivalentsBeforeEffectOfExchangeRateChanges"
         ]
     },
     "ComprehensiveIncome": {
@@ -1271,7 +1286,7 @@ class StatementResolver:
             period_of_report = getattr(self.xbrl, 'period_of_report', 'Unknown')
 
             if len(statements) == 0:
-                raise StatementNotFound(
+                raise StatementNotFoundError(
                     statement_type=statement_type,
                     confidence=conf,
                     found_statements=[],
@@ -1282,7 +1297,7 @@ class StatementResolver:
                 )
             elif conf < 0.3:
                 found_statements = [s['definition'] for s in statements]
-                raise StatementNotFound(
+                raise StatementNotFoundError(
                     statement_type=statement_type,
                     confidence=conf,
                     found_statements=found_statements,

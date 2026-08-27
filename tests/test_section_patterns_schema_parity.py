@@ -12,7 +12,40 @@ design mandates *before* the move:
     deliberately re-snapshotted when 424B adopted the full prospectus vocabulary
     it now shares with S-1 (gh-878 / edgartools-ti82): a final IPO prospectus
     repeats the entire S-1 body, so 424B must recognise the same narrative
-    sections. The drift guard on the other four forms is untouched.
+    sections. The 10-K entry was re-snapshotted for edgartools-4agg, which added
+    the seven items that had no vocabulary entry at all (4, 5, 6, 9, 9B, 9C, 15)
+    — on a filing whose only usable headers are "Item N" markers those items were
+    unrecoverable and their content was absorbed by the preceding item. That
+    change is purely additive: no pre-existing pattern was edited or removed.
+    The 10-K, 10-Q and 20-F entries were re-snapshotted again for the
+    item-separator fix (edgartools-dt1f): every item-numbered pattern now takes
+    its separator from ``_ITEM_SEP`` rather than spelling ``\\.?\\s*`` inline,
+    so that "Item 1: Business" and "Item 1 - Business" match as well as
+    "Item 1. Business". Each new pattern accepts a strict superset of what its
+    predecessor accepted — see
+    tests/issues/regression/test_dt1f_item_separator.py, which asserts that
+    superset property against this file's own previous spelling rather than
+    trusting the re-snapshot.
+    The same three entries were re-snapshotted once more on 2026-08-22 for
+    edgartools-dt1f.1 Defect B: ``_ITEM_SEP`` gained an optional parenthesized
+    designation, so "ITEM 9A(T). CONTROLS AND PROCEDURES" — the SEC's
+    transitional designation for a smaller reporting company's internal-control
+    report, roughly 2007-2010 — matches item 9A instead of dying on the "(".
+    68 of the 274 patterns changed and every one of them by that substitution
+    alone: no pattern was edited, reordered, relabelled or removed, and the new
+    separator accepts a strict superset of the old spellings. Both properties
+    were asserted mechanically before the file was rewritten, which is the only
+    thing that makes a re-snapshot meaningful — a golden regenerated from the
+    code it is supposed to be guarding proves nothing on its own.
+    The 10-K entry alone was re-snapshotted on 2026-08-22 for edgartools-dt1f.1
+    Defect A: Items 4 and 14 have each carried two titles, and only the modern
+    one was in the vocabulary, so every pre-2011 "Item 4: Submission of Matters
+    to a Vote of Security Holders" and pre-2003 "Item 14: Exhibits, Financial
+    Statement Schedules and Reports on Form 8-K" was found as a header and then
+    discarded at match time. Two patterns were APPENDED, one to each key; the
+    same mechanical check as above was run first and showed every pre-existing
+    pattern, label and ordering byte-identical, with the diff confined to those
+    two additions.
   * The data must actually live on the schema now (``FormSchema.section_patterns``),
     not only on the extractor — that is what lets the Phase 3 routing flip
     (edgartools-llmp.3) feed prospectus section text through the TOC engine using

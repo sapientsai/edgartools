@@ -10,7 +10,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from edgar._filings import Attachments
-from edgar.company_reports._base import CompanyReport
+from edgar.company_reports._base import CompanyReport, report_lookup_miss
 from edgar.company_reports._structures import ItemOnlyFilingStructure, extract_items_from_sections
 from edgar.documents import HTMLParser, ParserConfig
 from edgar.files.html import Document
@@ -48,6 +48,15 @@ def _normalize_item_number(item_str: str) -> str:
     return cleaned
 
 
+# An item header is anchored either at the start of a line, or immediately after a
+# horizontal rule of 5 or more rule characters on the same line. 2005-era filings that
+# are plain text wrapped in minimal HTML glue the two together with no line break
+# ("------------Item 4.02 Non-Reliance on..."), which a line-start-only anchor misses.
+# The anchor stays deliberately narrow: anything looser would promote mid-sentence
+# references ("as described in Item 8.01") into items. (edgartools-l6cl)
+_ITEM_ANCHOR = r'(?:^[ \t]*|[-=_─–—]{5,}[ \t]*)'
+
+
 def _extract_items_from_text(text: str) -> List[str]:
     """
     Extract 8-K item numbers from filing text using pattern matching.
@@ -77,22 +86,23 @@ def _extract_items_from_text(text: str) -> List[str]:
         - GitHub Issue: #462
         - Beads Issue: edgartools-k1k
     """
-    # Extract items that appear at the start of lines (with optional leading whitespace).
-    # This ensures consistency with _extract_item_content_from_text which
-    # requires items to be at line starts for content extraction.
+    # Extract items that appear at the start of lines (with optional leading whitespace)
+    # or immediately after a horizontal rule. This ensures consistency with
+    # _extract_item_content_from_text, which uses the same anchor for content extraction.
     #
-    # Pattern matches "Item X" or "Item X.XX" at start of line
+    # Pattern matches "Item X" or "Item X.XX" at an item-header anchor
     # This will match:
     # - "Item 1" (standalone)
     # - "  Item 1" (indented — common in HTML-to-text conversion)
     # - "Item 1-Item 4" (only Item 1, since it's at line start)
     # - "Item 2.02" (modern format)
+    # - "--------Item 4.02" (glued onto a horizontal rule)
     #
     # This will NOT match:
-    # - "Item 1-Item 4" (Item 4, not at line start)
+    # - "Item 1-Item 4" (Item 4, only one dash — not a rule, not at line start)
     # - Mid-sentence references to items
     pattern = re.compile(
-        r'^\s*Item\s+(\d+\.?\s*\d*)',
+        _ITEM_ANCHOR + r'Item\s+(\d+\.?\s*\d*)',
         re.IGNORECASE | re.MULTILINE
     )
     matches = pattern.findall(text)
@@ -198,9 +208,10 @@ def _extract_item_content_from_text(filing_text: str, item_name: str) -> Optiona
 
     # Step 2: Find item header in text
     # Pattern matches: "Item 9", "Item 9.", "Item 9:", "Item 9.02", etc.
-    # Must be at start of line (^) to avoid false positives
+    # Must sit at an item-header anchor (line start, or after a horizontal rule)
+    # to avoid matching mid-sentence references
     item_pattern = re.compile(
-        rf'^\s*(Item\s+{re.escape(item_num)}[\s\.:\-]*)',
+        rf'{_ITEM_ANCHOR}(Item\s+{re.escape(item_num)}[\s\.:\-]*)',
         re.IGNORECASE | re.MULTILINE
     )
 
@@ -208,18 +219,17 @@ def _extract_item_content_from_text(filing_text: str, item_name: str) -> Optiona
     if not match:
         return None
 
-    start_pos = match.start()
+    # Content starts at the header itself, not at the rule or indentation the
+    # anchor consumed.
+    start_pos = match.start(1)
 
     # Step 3: Find end position
     # Look for next "Item X" pattern
     next_item_pattern = re.compile(
-        r'^\s*Item\s+\d+\.?\s*\d*[\s\.:\-]',
+        _ITEM_ANCHOR + r'Item\s+\d+\.?\s*\d*[\s\.:\-]',
         re.IGNORECASE | re.MULTILINE
     )
-    next_match = next_item_pattern.search(
-        filing_text,
-        start_pos + len(match.group(0))
-    )
+    next_match = next_item_pattern.search(filing_text, match.end(1))
 
     if next_match:
         end_pos = next_match.start()
@@ -648,7 +658,9 @@ class CurrentReport(CompanyReport):
             return PressReleases(press_release_results)
 
     @cached_property
-    def chunked_document(self):
+    def _chunked_document(self):
+        # Construction only; the deprecation lives on the public property in
+        # CompanyReport. See the note there.
         html = self._filing.html()
         if not html:
             return None
@@ -662,30 +674,29 @@ class CurrentReport(CompanyReport):
 
     @property
     def doc(self):
-        return self.chunked_document
+        return self._chunked_document
 
     @property
     def items(self) -> List[str]:
         """
         List of detected item names (consistent with sections property).
 
-        Uses multi-tier fallback strategy:
+        Unions two detection strategies, both reading the primary document:
         1. New parser's section detection (95% accuracy for modern filings)
-        2. Chunked document parser (legacy parser)
-        3. Text-based pattern extraction (100% accuracy, all eras including SGML)
+        2. Text-based pattern extraction (all eras including SGML)
 
-        The text-based fallback handles legacy SGML filings (1999-2001) where
+        The text-based strategy handles legacy SGML filings (1999-2001) where
         SEC metadata is incomplete (GitHub issue #462).
 
         Returns:
             List of item titles for backward compatibility (e.g., ['Item 5.02', 'Item 9.01'])
         """
-        # The new parser (strategy 1) is high-precision for modern filings but can
-        # silently miss an item whose body is present — e.g. an Item 1.05
-        # cybersecurity disclosure that only shows Item 9.01 in the parsed sections
-        # (edgartools-83gh). The chunked parser operates on the same primary
-        # document (no exhibit text, so no false positives from press releases),
-        # so unioning the two recovers missed items without over-reporting.
+        # Two strategies, unioned rather than tried in order. The new parser
+        # (strategy 1) is high-precision but narrow: it reads the parsed section
+        # tree, which is empty on filings whose primary document is plain text in
+        # minimal HTML. The text strategy reads the same primary document (no
+        # exhibit text, so no false positives from press releases), which is what
+        # makes it safe to union rather than merely to fall back to.
         item_set = set()
 
         # Strategy 1: new parser section detection (95% rate for modern filings)
@@ -700,27 +711,22 @@ class CurrentReport(CompanyReport):
             if parser_items and any('.' in item for item in parser_items):
                 item_set.update(_canonical_item(item) for item in parser_items)
 
-        # Strategy 2: chunked parser of the primary document — backfills items the
-        # new parser missed; same precision domain (excludes exhibit text).
-        if self.chunked_document:
-            chunked_items = self.chunked_document.list_items()
-            if chunked_items:
-                item_set.update(_canonical_item(item) for item in chunked_items)
-
-        if item_set:
-            return sorted(item_set, key=_item_sort_key)
-
-        # Strategy 3: Text-based fallback for legacy SGML filings (no HTML)
-        # This handles filings where SEC metadata is incomplete (particularly 1999-2001)
-        # Use cached text extraction to improve performance
+        # Strategy 2: text-based pattern extraction. It is the only source for legacy
+        # SGML filings (1999-2001, no usable HTML) and for 2005-era filings that are
+        # plain text in minimal HTML, where strategy 1 returns nothing at all — on
+        # Cimarex 0001047469-05-006981 both of the items present come from here.
+        # It is unioned in rather than used only when strategy 1 comes up empty
+        # because a partial section tree is not the same as an absent one.
+        # (edgartools-l6cl)
         filing_text = self._get_filing_text()
         if filing_text:
-            extracted_items = _extract_items_from_text(filing_text)
-            if extracted_items:
-                # Format for display consistency: ['2.02', '9.01'] -> ['Item 2.02', 'Item 9.01']
-                return [_format_item_for_display(item) for item in extracted_items]
+            # Format for display consistency: ['2.02', '9.01'] -> ['Item 2.02', 'Item 9.01']
+            item_set.update(
+                _format_item_for_display(item)
+                for item in _extract_items_from_text(filing_text)
+            )
 
-        return []
+        return sorted(item_set, key=_item_sort_key)
 
     def __getitem__(self, item_name: str):
         """
@@ -728,8 +734,7 @@ class CurrentReport(CompanyReport):
 
         Uses multi-tier fallback strategy:
         1. New parser's section detection (95% accuracy for modern filings)
-        2. Chunked document parser (legacy parser)
-        3. Text-based pattern extraction (100% accuracy, all eras including SGML)
+        2. Text-based pattern extraction (100% accuracy, all eras including SGML)
 
         The text-based fallback handles legacy SGML filings (1999-2001) where
         HTML is unavailable (GitHub issue #462).
@@ -762,19 +767,7 @@ class CurrentReport(CompanyReport):
                 if normalized_key == normalized_input:
                     return section.text()
 
-        # Strategy 2: Fallback to old chunked_document for backward compatibility.
-        # Only return a hit — chunked_document returns None for an unmatched key
-        # (e.g. '1.05' when it indexes by 'Item 1.05'); returning that None here
-        # would short-circuit the text-based fallback below. (edgartools-83gh)
-        if self.chunked_document:
-            try:
-                result = self.chunked_document[item_name]
-                if result:
-                    return result
-            except (KeyError, TypeError):
-                pass
-
-        # Strategy 3: Text-based fallback for legacy SGML filings
+        # Strategy 2: Text-based fallback for legacy SGML filings
         # This handles filings where HTML is unavailable but text exists
         # Use cached text extraction to improve performance
         filing_text = self._get_filing_text()
@@ -783,6 +776,7 @@ class CurrentReport(CompanyReport):
             if content:
                 return content
 
+        report_lookup_miss(self, item_name)
         return None
 
     def view(self, item_or_part: str):

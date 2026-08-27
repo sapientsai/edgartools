@@ -82,6 +82,12 @@ def test_parse_offering_with_multiple_signatures():
     print(offering)
     assert len(offering.signature_block.signatures) == 2
 
+    # <issuerPreviousNameList><previousName>None</previousName></issuerPreviousNameList>:
+    # the "no previous names" placeholder written with the <previousName> spelling,
+    # not <value> (edgartools-gi0a). Must be filtered the same way as the <value> spelling.
+    assert offering.primary_issuer.issuer_previous_names == []
+    assert offering.primary_issuer.edgar_previous_names == []
+
 
 def test_parse_offering_with_all_states_sales_compensation():
     offering: FormD = FormD.from_xml(formD_xml3)
@@ -92,11 +98,29 @@ def test_parse_offering_with_all_states_sales_compensation():
     assert offering.offering_data.sales_compensation_recipients[0].crd == ""
     assert offering.offering_data.sales_compensation_recipients[0].states_of_solicitation == ["All States"]
 
+    # Regression for edgartools-gi0a: Shepherd's Finance, LLC (CIK 0001544190) was
+    # renamed from 84 RE Partners, LLC. SEC wrote the previous name with the
+    # <previousName> spelling, not <value>, and it was silently dropped.
+    assert offering.primary_issuer.issuer_previous_names == ["84 RE Partners, LLC"]
+    assert offering.primary_issuer.edgar_previous_names == []
+
 
 def test_formd_industry_group_none():
     filing = Filing(form='D', filing_date='2024-04-03', company='Avise Financial Cooperative, Inc.', cik=2013342, accession_no='0002013342-24-000001')
     formd:FormD = filing.obj()
     assert formd.offering_data.industry_group.investment_fund_info is None
+
+def test_formd_sales_compensation_recipient_associated_bd_name():
+    # Regression for edgartools-aq2r: associated_bd_name was a bare annotation
+    # (`self.associated_bd_name: associated_bd_name`), not an assignment, so it
+    # was never set and raised AttributeError on access.
+    offering: FormD = FormD.from_xml(formD_xml1)
+    recipients = offering.offering_data.sales_compensation_recipients
+    assert len(recipients) == 4
+    assert recipients[0].name == "Charles Harrison"
+    assert recipients[0].associated_bd_name == "H & L Equities, LLC"
+    assert recipients[0].associated_bd_crd == "113794"
+
 
 def test_formd_business_combination():
     filing = Filing(form='D/A', filing_date='2024-04-03', company='REMY CAPITAL PARTNERS II L P', cik=920660,

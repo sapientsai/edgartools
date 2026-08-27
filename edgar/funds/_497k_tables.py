@@ -14,7 +14,10 @@ import re
 from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Optional, Tuple
 
-from bs4 import BeautifulSoup, Tag
+import lxml.html
+from lxml.etree import ParserError, strip_elements
+
+from edgar.documents.utils.html_utils import create_lxml_parser
 
 log = logging.getLogger(__name__)
 
@@ -37,23 +40,50 @@ def _normalize(text: str) -> str:
 
 
 def _parse_percentage(text: str) -> Optional[Decimal]:
-    """Parse '0.14%', '- 22.03 %', 'None', '—', '' into Optional[Decimal]."""
+    """Parse '0.14%', '- 22.03 %', '0.67 1', '(0.05) 3', 'None', '—', ''.
+
+    Filers routinely put the footnote marker in the value cell itself,
+    separated by whitespace ('0.67 1', '0.46 3 4') or appended as a symbol
+    ('0.67*'). Only the leading numeric token is the value; anything after
+    it is a marker and is discarded. Collapsing whitespace first would glue
+    the marker onto the number instead ('0.67 1' -> 0.671).
+    """
     text = text.strip().replace('\xa0', ' ').replace(',', '')
     if not text or text.lower().strip() in ('none', '—', '–', '-', 'n/a', ''):
         return None
+
+    # Unwrap a parenthesised (negative) value before touching the % sign,
+    # because filers put the sign on either side of the bracket — "(0.19)%"
+    # and "(0.37%)" both occur. Stripping "%" and everything after it first
+    # would eat the closing bracket of the latter and lose the value.
+    negative = False
+    match = re.match(r'^\(\s*([-+]?\s*\d*\.?\d+)\s*%?\s*\)', text)
+    if match:
+        negative = True
+        text = match.group(1)
+
     # Remove % sign and everything after it
-    text = re.sub(r'%.*', '', text)
-    # Remove trailing footnote markers (letters, spaces)
-    text = re.sub(r'[A-Za-z,]+$', '', text).strip()
+    text = re.sub(r'%.*', '', text).strip()
     if not text:
         return None
-    # Collapse internal spaces (handles "- 22.03" → "-22.03")
-    text = re.sub(r'\s+', '', text)
-    # Handle negative: "(0.05)" -> "-0.05"
-    if text.startswith('(') and text.endswith(')'):
-        text = '-' + text[1:-1]
+
+    # Leading numeric token, allowing a space after the sign ("- 22.03").
+    match = re.match(r'^([-+]?\s*\d*\.?\d+)', text)
+    if not match:
+        return None
+    # Whatever follows the number must look like a footnote marker — digits
+    # or a reference symbol, optionally bracketed. Anything else means the
+    # digits were part of something that is not a value at all: "2/1/2010",
+    # "9-13-2017", "12b-1 Distribution Fee", "4Q 2023", "5 Years".
+    trailing = text[match.end():].strip()
+    if trailing and not re.fullmatch(r'[\d\s*†‡§]+|\(\s*[\d\s*†‡§]+\s*\)', trailing):
+        return None
+
+    number = re.sub(r'\s+', '', match.group(1))
+    if negative:
+        number = '-' + number.lstrip('+-')
     try:
-        return Decimal(text)
+        return Decimal(number)
     except (InvalidOperation, ValueError):
         return None
 
@@ -70,16 +100,66 @@ def _parse_dollar(text: str) -> Optional[int]:
         return None
 
 
-def _get_cell_text(cell: Tag) -> str:
-    """Get clean text from a table cell."""
-    return cell.get_text(separator=' ', strip=True)
+def _parse_html(html: str):
+    """Parse a 497K document into an lxml tree.
+
+    Replaces ``BeautifulSoup(html, 'lxml')``, which already ran on libxml2 --
+    this removes bs4's tree on top of it rather than swapping the parser. Three
+    details still matter:
+
+    * **bytes, not str.** lxml refuses a ``str`` carrying an encoding
+      declaration, and encoding here makes the parser's own utf-8 win over
+      whatever the document declares.
+    * **``remove_comments=False``.** Removing a comment merges the strings
+      either side into one node, which changes what the per-cell strip-and-join
+      produces for ``Management <!-- note --> Fee``.
+    * **``strip_elements``.** bs4 classified the text inside ``<script>``,
+      ``<style>`` and ``<template>`` as Script/Stylesheet/TemplateString and
+      left all three out of ``get_text()``; lxml puts them in, and a stylesheet
+      inside a fee table is enough to change how ``_classify_table`` labels it.
+      ``with_tail=False`` keeps the ordinary text after the closing tag.
+
+    Returns ``None`` for input lxml cannot root at all, where BeautifulSoup
+    returned an empty soup.
+    """
+    if isinstance(html, str):
+        html = html.encode('utf-8', errors='replace')
+    try:
+        root = lxml.html.fromstring(html, parser=create_lxml_parser(remove_comments=False))
+    except ParserError:
+        return None
+    strip_elements(root, 'script', 'style', 'template', with_tail=False)
+    return root
 
 
-def _table_texts(table: Tag) -> List[List[str]]:
+def _tables(root) -> List:
+    """Every ``<table>``, in document order.
+
+    ``descendant-or-self``, not ``.//``: lxml roots a single-element fragment
+    AT that element, so a document that IS a table has no descendant tables.
+    """
+    return [] if root is None else root.xpath('descendant-or-self::table')
+
+
+def _get_cell_text(cell) -> str:
+    """Get clean text from a table cell.
+
+    ``cell.get_text(separator=' ', strip=True)``: strip each string, drop the
+    ones left empty, join the rest with a single SPACE. ``text_content()`` is
+    not it -- that joins the raw strings, so a label typeset as
+    ``<font>Management</font><font>Fee</font>`` reads "ManagementFee" and
+    ``_is_fee_label`` stops recognising the row.
+    """
+    return ' '.join(chunk.strip() for chunk in cell.itertext() if chunk.strip())
+
+
+def _table_texts(table) -> List[List[str]]:
     """Extract all cell texts from a table as a 2D list."""
     rows = []
-    for tr in table.find_all('tr'):
-        cells = tr.find_all(['td', 'th'])
+    for tr in table.iter('tr'):
+        # ONE list in document order -- not the tds followed by the ths. Every
+        # extractor downstream is positional.
+        cells = list(tr.iter('td', 'th'))
         rows.append([_get_cell_text(c) for c in cells])
     return rows
 
@@ -243,11 +323,28 @@ def _extract_operating_expenses(rows: List[List[str]]) -> List[Dict]:
                 data['acquired_fund_fees'] = _parse_percentage(value)
             elif 'total annual' in label and 'after' not in label:
                 data['total_annual_expenses'] = _parse_percentage(value)
-            elif 'fee waiver' in label or 'reimbursement' in label:
-                data['fee_waiver'] = _parse_percentage(value)
+            # Net expenses must be tested before the waiver, because the
+            # standard SEC wording for the net row — "Total Annual Fund
+            # Operating Expenses After Fee Waiver and Reimbursement" —
+            # contains "fee waiver" too. Matching the waiver first captured
+            # the net ratio as the waiver and left net_expenses unreachable.
+            # Anchored on the start of the label: filers sometimes spill the
+            # footnote prose into the waiver's own label cell, and that prose
+            # routinely contains both "total ... expenses" and "after", which
+            # an unanchored match would misread as the net row.
             elif ('net expense' in label or
-                  ('total' in label and 'after' in label)):
+                  label.startswith('net') or
+                  (label.startswith('total') and 'after' in label)):
                 data['net_expenses'] = _parse_percentage(value)
+            elif 'fee waiver' in label or 'reimbursement' in label:
+                # Filers render the waiver either parenthesized ("(0.19)%") or
+                # bare ("0.03%"). Normalize to a signed reduction so that
+                # total_annual_expenses + fee_waiver == net_expenses holds
+                # regardless of how the filer wrote it.
+                waiver = _parse_percentage(value)
+                if waiver is not None and waiver > 0:
+                    waiver = -waiver
+                data['fee_waiver'] = waiver
 
         results.append(data)
 
@@ -537,8 +634,7 @@ def extract_fee_tables(html: str, class_info: Optional[List[Dict]] = None) -> Li
         html: The HTML content of the 497K filing
         class_info: Optional list of class dicts from SGML header with 'name' and 'ticker' keys
     """
-    soup = BeautifulSoup(html, 'lxml')
-    tables = soup.find_all('table')
+    tables = _tables(_parse_html(html))
 
     # Classify all tables
     classified = []
@@ -639,8 +735,7 @@ def extract_performance_table(html: str) -> Tuple[List[Dict],
         - best_quarter: (return_pct, date_str) or None
         - worst_quarter: (return_pct, date_str) or None
     """
-    soup = BeautifulSoup(html, 'lxml')
-    tables = soup.find_all('table')
+    tables = _tables(_parse_html(html))
 
     all_performance = []
     best_quarter = None
@@ -674,9 +769,14 @@ def extract_fund_metadata(html: str) -> Dict:
     Returns dict with keys: fund_name, prospectus_date, portfolio_turnover,
     investment_objective, portfolio_managers, min_investments.
     """
-    soup = BeautifulSoup(html, 'lxml')
-    text = soup.get_text(separator='\n', strip=True)
-    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    root = _parse_html(html)
+    # ``get_text(separator='\n', strip=True)``: strip each string, drop the
+    # empties, join with a newline. Every pattern below is DOTALL, so the
+    # separator only has to be whitespace -- but it has to be there, and
+    # ``text_content()`` would not put it there.
+    text = '' if root is None else '\n'.join(
+        chunk.strip() for chunk in root.itertext() if chunk.strip()
+    )
 
     result = {
         'fund_name': None,

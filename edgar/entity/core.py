@@ -5,6 +5,7 @@ This module provides the main classes for interacting with SEC entities,
 including companies, funds, and individuals.
 """
 import re
+import warnings
 from abc import ABC, abstractmethod
 from datetime import date
 from functools import cached_property
@@ -30,7 +31,8 @@ from edgar._filings import Filings
 from edgar.company_reports import TenK, TenQ
 from edgar.display.styles import get_style, SYMBOLS
 from edgar.entity.data import Address, CompanyData, EntityData
-from edgar.entity.entity_facts import EntityFacts, NoCompanyFactsFound, get_company_facts
+from edgar.entity.entity_facts import EntityFacts, get_company_facts
+from edgar.exceptions import CompanyFactsNotFoundError, CompanyNotFoundError
 from edgar.entity.tickers import get_icon_from_ticker
 from edgar.financials import Financials
 from edgar.display.formatting import cik_text, datefmt, reverse_name
@@ -61,29 +63,17 @@ __all__ = [
     'ConceptList',
     'get_entity',
     'get_company',
-    'NoCompanyFactsFound',
+    'CompanyFactsNotFoundError',
+    'NoCompanyFactsFound',  # deprecated alias, removed in 6.0
     'has_company_filings',
     'COMPANY_FORMS',
 ]
 
 
-class CompanyNotFoundError(Exception):
-    """Raised when a company cannot be found by ticker, CIK, or name."""
-
-    def __init__(self, identifier, suggestions=None):
-        self.identifier = identifier
-        self.suggestions = suggestions or []
-        super().__init__(str(self))
-
-    def __str__(self):
-        msg = f"Company not found: '{self.identifier}'"
-        if self.suggestions:
-            suggestions_str = ", ".join(
-                f"'{s['ticker']}' ({s['company']})" for s in self.suggestions[:3]
-            )
-            msg += f"\n  Similar: {suggestions_str}"
-        msg += "\n  Tip: Search by name with find_company(\"...\") or pass a CIK directly."
-        return msg
+# CompanyNotFoundError is defined in edgar.exceptions under the NotFoundError
+# branch (bead edgartools-07lk.10) and imported above. It keeps its identifier,
+# its fuzzy suggestions and its message verbatim — it is the one exception this
+# library already documented publicly (docs/api/company.md).
 
 
 def _get_suggestions(identifier: str, max_suggestions: int = 3):
@@ -480,7 +470,7 @@ class Entity(SecFiler):
                 # Apply period type filtering to the facts
                 return facts.filter_by_period_type(period_type)
             return facts
-        except NoCompanyFactsFound:
+        except CompanyFactsNotFoundError:
             return None
 
     def get_structured_statement(self,
@@ -615,14 +605,25 @@ class Company(Entity):
         income statement, balance sheet, and cash flow statement.
 
         Returns:
-            Financials object, or None if no annual filing is available
+            Financials object, or None — and None means exactly one thing: this
+            company has filed no 10-K, 20-F or 40-F that we can see. It is never
+            how a failure is reported. If we could not reach SEC, a
+            ``TransportError`` propagates; if the filing was there but would not
+            parse, a ``ParsingError`` does.
+
+            One case is neither: an annual report that predates SEC's 2009-2011
+            XBRL phase-in carries no XBRL, so there is nothing to build
+            statements from. You get a ``Financials`` back — not None, so the
+            guard above passes — whose every accessor answers None. That path
+            now warns, and raises ``XBRLFilingWithNoXbrlData`` in 6.0. Set
+            ``EDGARTOOLS_STRICT_ERRORS=1`` for the 6.0 behaviour today.
 
         Example::
 
             financials = Company("AAPL").get_financials()
             financials.income_statement()
             financials.balance_sheet()
-            financials.cashflow_statement()
+            financials.cash_flow_statement()
             financials.get_revenue()        # Quick access to a single value
         """
         tenk_filing = self.latest_tenk
@@ -644,7 +645,14 @@ class Company(Entity):
         but with quarterly data instead of annual.
 
         Returns:
-            Financials object, or None if no quarterly filing is available
+            Financials object, or None — and None means exactly one thing: this
+            company has filed no 10-Q or 6-K that we can see. It is never how a
+            failure is reported; a transport or parsing failure raises.
+
+            As with ``get_financials()``, a quarterly report with no XBRL is
+            neither: it returns a ``Financials`` whose accessors all answer
+            None. That path warns, and raises ``XBRLFilingWithNoXbrlData`` in
+            6.0.
 
         Example::
 
@@ -826,9 +834,14 @@ class Company(Entity):
         """
         Classify a REIT as equity or mortgage.
 
-        Mortgage REITs invest in mortgage-backed securities and loans,
-        reporting InterestIncomeExpenseNet as their dominant revenue.
-        Equity REITs own and operate real property.
+        Equity REITs own and operate real property, earning rental income.
+        Mortgage REITs invest in mortgage-backed securities and loans, earning
+        net interest income.
+
+        Classification compares the *magnitude* of property/rental income
+        against net interest income — not the mere presence of an interest
+        line — so a flagship net-lease equity REIT with a negligible interest
+        item (e.g. W. P. Carey) is not mislabeled 'mortgage'.
 
         Returns None immediately for non-REIT companies (no network call).
 
@@ -850,11 +863,27 @@ class Company(Entity):
             return None
 
         import warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore')
-            if facts.get_fact('us-gaap:InterestIncomeExpenseNet') is not None:
-                return 'mortgage'
-        return 'equity'
+
+        from edgar.entity.categorization import (
+            REIT_INTEREST_CONCEPTS,
+            REIT_PROPERTY_CONCEPTS,
+            classify_reit_subtype,
+        )
+
+        def _income_magnitude(concepts) -> float:
+            """Largest absolute annual value across the given concepts (0 if none)."""
+            best = 0.0
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                for concept in concepts:
+                    fact = facts.get_annual_fact(concept) or facts.get_fact(concept)
+                    if fact is not None and fact.numeric_value is not None:
+                        best = max(best, abs(fact.numeric_value))
+            return best
+
+        property_income = _income_magnitude(REIT_PROPERTY_CONCEPTS)
+        interest_income = _income_magnitude(REIT_INTEREST_CONCEPTS)
+        return classify_reit_subtype(property_income, interest_income)
 
     def is_fund(self) -> bool:
         """
@@ -1085,7 +1114,7 @@ class Company(Entity):
                 log.debug(f"Error getting balance sheet for {self.name}: {e}")
         return None
 
-    def cashflow_statement(
+    def cash_flow_statement(
         self,
         periods: int = 4,
         period: str = 'annual',
@@ -1114,7 +1143,7 @@ class Company(Entity):
             return None
 
         try:
-            return facts.cashflow_statement(
+            return facts.cash_flow_statement(
                 periods=periods,
                 period=period,
                 as_dataframe=as_dataframe,
@@ -1133,22 +1162,29 @@ class Company(Entity):
         as_dataframe: bool = False,
         concise_format: bool = False
     ) -> Union["MultiPeriodStatement", TTMStatement, "pd.DataFrame", None]:
-        """Deprecated: Use cashflow_statement() instead."""
+        """Deprecated: Use cash_flow_statement() instead."""
         import warnings
         warnings.warn(
             "cash_flow() is deprecated and will be removed in v6.0. "
-            "Use cashflow_statement() instead.",
+            "Use cash_flow_statement() instead.",
             DeprecationWarning,
             stacklevel=2
         )
-        return self.cashflow_statement(
+        return self.cash_flow_statement(
             periods=periods, period=period, annual=annual,
             as_dataframe=as_dataframe, concise_format=concise_format
         )
 
-    def cash_flow_statement(self, **kwargs):
-        """Alias for cashflow_statement()."""
-        return self.cashflow_statement(**kwargs)
+    def cashflow_statement(self, **kwargs):
+        """Deprecated: use :meth:`cash_flow_statement`."""
+        warnings.warn(
+            "cashflow_statement() is deprecated and will be removed in v6.0. "
+            "Use cash_flow_statement(), which matches income_statement() and "
+            "balance_sheet().",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.cash_flow_statement(**kwargs)
 
     # -------------------------------------------------------------------------
     # Concept Discovery Methods
@@ -1786,3 +1822,14 @@ def public_companies() -> Iterable[Company]:
         yield c
 
 
+
+
+# ---------------------------------------------------------------------------
+# Deprecated name (bead edgartools-07lk.10): NoCompanyFactsFound is now
+# CompanyFactsNotFoundError. Same object, so `except NoCompanyFactsFound:`
+# still works. Removed in 6.0.
+# ---------------------------------------------------------------------------
+from edgar._compat import deprecated_alias  # noqa: E402
+from edgar.exceptions import CompanyFactsNotFoundError as _CompanyFactsNotFoundError  # noqa: E402
+
+__getattr__ = deprecated_alias(NoCompanyFactsFound=_CompanyFactsNotFoundError)

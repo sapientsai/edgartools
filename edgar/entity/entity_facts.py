@@ -40,12 +40,15 @@ from edgar.httprequests import download_json
 from edgar.storage import get_edgar_data_directory, is_using_local_storage
 
 
-class NoCompanyFactsFound(Exception):
-    """Exception raised when no company facts are found for a given CIK."""
+# NoCompanyFactsFound is now CompanyFactsNotFoundError in edgar.exceptions
+# (bead edgartools-07lk.10). Its __init__ called super().__init__() with no
+# arguments and set self.message instead, so str(exc) was '' and the message
+# never reached a traceback or a log. The canonical class builds the message
+# and passes it up. Old name kept as a deprecated alias below.
+from edgar._compat import deprecated_alias
+from edgar.exceptions import CompanyFactsNotFoundError, TransportError, http_status
 
-    def __init__(self, cik: int):
-        super().__init__()
-        self.message = f"""No Company facts found for cik {cik}"""
+__getattr__ = deprecated_alias(NoCompanyFactsFound=CompanyFactsNotFoundError)
 
 
 def download_company_facts_from_sec(cik: int) -> Dict[str, Any]:
@@ -56,10 +59,14 @@ def download_company_facts_from_sec(cik: int) -> Dict[str, Any]:
     company_facts_url = build_company_facts_url(cik)
     try:
         return download_json(company_facts_url)
-    except httpx.HTTPStatusError as err:
-        if err.response.status_code == 404:
+    except (httpx.HTTPStatusError, TransportError) as err:
+        # The model for domain translation across both error eras: a 404 is
+        # something this layer understands, so it becomes the domain's own
+        # NotFoundError. Everything else propagates as a transport failure,
+        # because nobody here knows better than "we could not get an answer".
+        if http_status(err) == 404:
             log.warning(f"No company facts found on url {company_facts_url}")
-            raise NoCompanyFactsFound(cik=cik) from None
+            raise CompanyFactsNotFoundError(cik=cik) from None
         else:
             raise
 
@@ -70,11 +77,11 @@ def load_company_facts_from_local(cik: int) -> Dict[str, Any]:
     """
     company_facts_dir = get_edgar_data_directory() / "companyfacts"
     if not company_facts_dir.exists():
-        raise NoCompanyFactsFound(cik=cik)
+        raise CompanyFactsNotFoundError(cik=cik)
     cik_int = int(cik) if isinstance(cik, str) else cik
     company_facts_file = company_facts_dir / f"CIK{cik_int:010}.json"
     if not company_facts_file.exists():
-        raise NoCompanyFactsFound(cik=cik)
+        raise CompanyFactsNotFoundError(cik=cik)
 
     return json.loads(company_facts_file.read_text())
 
@@ -105,7 +112,7 @@ def get_company_facts(cik: int):
         CompanyFacts: The company facts
 
     Raises:
-        NoCompanyFactsFound: If no facts are found for the given CIK
+        CompanyFactsNotFoundError: If no facts are found for the given CIK
     """
     cached = _company_facts_cache.get(cik)
     if cached is not None:
@@ -1136,42 +1143,89 @@ class EntityFacts:
             warnings.warn(hint, stacklevel=2)
             return None
 
-        # Try each synonym in priority order.
         # If unit is not specified, do not force USD: share/count concepts
         # (for example weighted-average shares) should resolve with their
         # native units.
         target_unit = unit
         synonyms_tried = []
 
+        # Recency key for cross-synonym selection: newest filing wins, then the
+        # latest period covered. Mirrors get_fact()'s intra-tag ordering
+        # (max by (filing_date, period_end)). date.min guards facts missing a
+        # date so a comparison never raises.
+        def _recency_key(f: "FinancialFact"):
+            return (f.filing_date or date.min, f.period_end or date.min)
+
+        def _build_result(value, tag, unit_used, fact):
+            if not return_metadata:
+                return value
+            return {
+                'value': value,
+                'tag_used': tag,
+                # Resolved period of the fact actually returned — echoes the
+                # requested period, or the fact's own period when the caller
+                # passed period=None, so a stale pick is visible (GH #892).
+                'period': period if period is not None
+                          else f"{fact.fiscal_year}-{fact.fiscal_period}",
+                'period_end': fact.period_end,
+                'filing_date': fact.filing_date,
+                'unit': unit_used,
+                'concept_name': concept_name,
+                'synonyms_tried': synonyms_tried.copy(),
+            }
+
         # Suppress warnings from get_fact() during synonym resolution
         self._suppress_warnings = True
         try:
-            for concept in group.synonyms:
+            # Best candidate seen so far, when period is not specified:
+            # (recency_key, priority_index, value, tag, unit, fact).
+            best = None
+            for priority_index, concept in enumerate(group.synonyms):
                 synonyms_tried.append(concept)
                 # Try with all known taxonomy prefixes
                 for concept_variant in [concept, f'us-gaap:{concept}', f'ifrs-full:{concept}']:
                     fact = self.get_fact(concept_variant, period)
-                    if fact and fact.numeric_value is not None:
-                        unit_result = UnitNormalizer.get_normalized_value(
-                            fact=fact,
-                            target_unit=target_unit,
-                            apply_scale=True,
-                            strict_unit_match=unit is not None  # Strict when user explicitly specifies unit
+                    if not (fact and fact.numeric_value is not None):
+                        continue
+                    unit_result = UnitNormalizer.get_normalized_value(
+                        fact=fact,
+                        target_unit=target_unit,
+                        apply_scale=True,
+                        strict_unit_match=unit is not None  # Strict when user explicitly specifies unit
+                    )
+                    if not unit_result.success:
+                        continue
+
+                    if period is not None:
+                        # Explicit period: the priority ordering is authoritative
+                        # (the caller pinned the period, so there is no staleness
+                        # ambiguity) — first match wins, preserving prior behavior.
+                        return _build_result(
+                            unit_result.value, concept_variant,
+                            unit_result.normalized_unit, fact
                         )
 
-                        if unit_result.success:
-                            if return_metadata:
-                                return {
-                                    'value': unit_result.value,
-                                    'tag_used': concept_variant,
-                                    'period': period,
-                                    'unit': unit_result.normalized_unit,
-                                    'concept_name': concept_name,
-                                    'synonyms_tried': synonyms_tried.copy()
-                                }
-                            return unit_result.value
+                    # No period requested: do NOT stop at the first synonym that
+                    # happens to hold a fact. A company that switched GAAP tags
+                    # (e.g. NVDA/AMZN moving capex from
+                    # PaymentsToAcquirePropertyPlantAndEquipment to
+                    # PaymentsToAcquireProductiveAssets) still has stale facts
+                    # under the higher-priority tag; first-match-wins would return
+                    # those years-old values (GH #892). Instead pick the most
+                    # recent fact across all synonyms, tie-broken by priority.
+                    candidate = (_recency_key(fact), -priority_index,
+                                 unit_result.value, concept_variant,
+                                 unit_result.normalized_unit, fact)
+                    if best is None or candidate[:2] > best[:2]:
+                        best = candidate
+                    # One winning variant per synonym is enough.
+                    break
         finally:
             self._suppress_warnings = False
+
+        if best is not None:
+            _, _, value, tag, unit_used, fact = best
+            return _build_result(value, tag, unit_used, fact)
 
         return None
 
@@ -1629,6 +1683,39 @@ class EntityFacts:
         as_of_date = self._parse_ttm_date(as_of)
         return calc.calculate_ttm(as_of=as_of_date)
 
+    def _best_ttm_across_concepts(
+        self,
+        concepts: List[str],
+        as_of: Optional[Union[date, str]],
+        not_found_message: str,
+    ) -> 'TTMMetric':
+        """Compute TTM for each candidate concept and return the freshest result.
+
+        Companies migrate GAAP tags over time (e.g. NVDA/GOOG moved revenue from
+        ``RevenueFromContractWithCustomerExcludingAssessedTax`` to ``Revenues``).
+        The abandoned tag still holds years-old facts, so returning the *first*
+        candidate that resolves silently yields a stale TTM — off by more than an
+        order of magnitude, with no error (GH #893). Instead we evaluate every
+        candidate and pick the one whose window ends most recently (by
+        ``as_of_date``), tie-broken by the caller's priority order.
+        """
+        best = None  # ((as_of_date, -priority_index), TTMMetric)
+        for priority_index, concept in enumerate(concepts):
+            try:
+                metric = self.get_ttm(concept, as_of)
+            except (KeyError, ValueError):
+                # KeyError: concept absent. ValueError: present but <4 quarters.
+                # Either way it cannot yield a TTM — skip and keep searching so a
+                # stale-but-resolvable earlier candidate never masks a fresh one.
+                continue
+            key = (metric.as_of_date, -priority_index)
+            if best is None or key > best[0]:
+                best = (key, metric)
+
+        if best is None:
+            raise KeyError(not_found_message)
+        return best[1]
+
     def get_ttm_revenue(self, as_of: Optional[Union[date, str]] = None) -> 'TTMMetric':
         """Get Trailing Twelve Months revenue using common revenue concepts."""
         revenue_concepts = [
@@ -1637,22 +1724,16 @@ class EntityFacts:
             'SalesRevenueNet',
             'Revenue',
         ]
-        for concept in revenue_concepts:
-            try:
-                return self.get_ttm(concept, as_of)
-            except KeyError:
-                continue
-        raise KeyError("Could not find revenue concept in company facts")
+        return self._best_ttm_across_concepts(
+            revenue_concepts, as_of, "Could not find revenue concept in company facts"
+        )
 
     def get_ttm_net_income(self, as_of: Optional[Union[date, str]] = None) -> 'TTMMetric':
         """Get Trailing Twelve Months net income using common net income concepts."""
         income_concepts = ['NetIncomeLoss', 'NetIncome', 'ProfitLoss']
-        for concept in income_concepts:
-            try:
-                return self.get_ttm(concept, as_of)
-            except KeyError:
-                continue
-        raise KeyError("Could not find net income concept in company facts")
+        return self._best_ttm_across_concepts(
+            income_concepts, as_of, "Could not find net income concept in company facts"
+        )
 
     @cached_property
     def _ttm_ready_facts(self) -> 'EntityFacts':
@@ -1864,7 +1945,18 @@ class EntityFacts:
 
         return df
 
-    def cashflow_statement(self,
+    def cashflow_statement(self, **kwargs):
+        """Deprecated: use :meth:`cash_flow_statement`."""
+        warnings.warn(
+            "cashflow_statement() is deprecated and will be removed in v6.0. "
+            "Use cash_flow_statement(), which matches income_statement() and "
+            "balance_sheet().",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.cash_flow_statement(**kwargs)
+
+    def cash_flow_statement(self,
                            periods: int = 4,
                            period_length: Optional[int] = None,
                            as_dataframe: bool = False,
@@ -1887,14 +1979,14 @@ class EntityFacts:
 
         Example:
             # Get hierarchical multi-period statement (default)
-            stmt = facts.cashflow_statement(periods=4, annual=True)
+            stmt = facts.cash_flow_statement(periods=4, annual=True)
             print(stmt)  # Rich display with hierarchy
 
             # Get DataFrame for analysis
-            df = facts.cashflow_statement(periods=4, as_dataframe=True)
+            df = facts.cash_flow_statement(periods=4, as_dataframe=True)
 
             # Convert statement to DataFrame later
-            stmt = facts.cashflow_statement(periods=4)
+            stmt = facts.cash_flow_statement(periods=4)
             df = stmt.to_dataframe()
         """
         if annual is not None:
@@ -1925,14 +2017,14 @@ class EntityFacts:
 
     def cash_flow(self, periods: int = 4, period_length: Optional[int] = None, as_dataframe: bool = False,
                   annual: bool = True, concise_format: bool = False) -> Union[DataFrame, MultiPeriodStatement]:
-        """Deprecated: Use cashflow_statement() instead."""
+        """Deprecated: Use cash_flow_statement() instead."""
         warnings.warn(
             "cash_flow() is deprecated and will be removed in v6.0. "
-            "Use cashflow_statement() instead.",
+            "Use cash_flow_statement() instead.",
             DeprecationWarning,
             stacklevel=2
         )
-        return self.cashflow_statement(periods=periods, period_length=period_length,
+        return self.cash_flow_statement(periods=periods, period_length=period_length,
                                        as_dataframe=as_dataframe, annual=annual,
                                        concise_format=concise_format)
 

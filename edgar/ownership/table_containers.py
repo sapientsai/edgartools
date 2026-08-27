@@ -6,9 +6,10 @@ for the ``<nonDerivativeTable>`` / ``<derivativeTable>`` sections of a Form 3/4/
 filing, including the ``extract*`` classmethods that parse them out of the XML.
 The row records and their ``DataHolder`` collection wrappers live in ``tables``.
 """
+from typing import Optional
+
 import numpy as np
 import pandas as pd
-from bs4 import Tag
 from rich.console import Group, Text
 from rich.panel import Panel
 
@@ -25,12 +26,33 @@ from edgar.ownership.tables import (
     NonDerivativeTransactions,
 )
 from edgar.richtools import repr_rich
-from edgar.xmltools import child_text, child_value
+from edgar.xmltools import XmlNode, child_text, child_value, find_all_elements, find_element
 
 __all__ = [
     'NonDerivativeTable',
     'DerivativeTable',
 ]
+
+# Columns sourced from a transaction's <transactionCoding> block. They are only
+# populated for transactions that carry that element, so a table where no
+# transaction has coding produces a DataFrame missing these columns entirely.
+_TRANSACTION_CODING_COLUMNS = ('form', 'Code', 'EquitySwap')
+
+
+def _ensure_coding_columns(transaction_df: pd.DataFrame) -> pd.DataFrame:
+    """Guarantee the <transactionCoding>-derived columns exist.
+
+    Some real Form 4/5 filings have transactions with no <transactionCoding>
+    element. When *no* transaction in a table has coding, the assembled
+    DataFrame lacks the 'Code' column and the downstream
+    ``df.Code.apply(...)`` raised ``AttributeError``, aborting the parse of the
+    whole filing (GH #887). Defaulting the missing columns to ``None`` lets
+    those rows degrade gracefully (``TransactionType`` becomes ``None``) instead.
+    """
+    for column in _TRANSACTION_CODING_COLUMNS:
+        if column not in transaction_df.columns:
+            transaction_df[column] = None
+    return transaction_df
 
 
 class NonDerivativeTable:
@@ -78,26 +100,24 @@ class NonDerivativeTable:
 
     @classmethod
     def extract(cls,
-                table: Tag,
+                table: Optional[XmlNode],
                 form: str):
-        if not table:
+        if table is None:
             return cls(holdings=NonDerivativeHoldings(), transactions=NonDerivativeTransactions(), form=form)
         transactions = NonDerivativeTable.extract_transactions(table)
         holdings = NonDerivativeTable.extract_holdings(table)
         return cls(transactions=transactions, holdings=holdings, form=form)
 
     @staticmethod
-    def extract_holdings(table: Tag) -> NonDerivativeHoldings:
-        holding_tags = table.find_all("nonDerivativeHolding")
+    def extract_holdings(table: XmlNode) -> NonDerivativeHoldings:
+        holding_tags = find_all_elements(table, "nonDerivativeHolding")
         if len(holding_tags) == 0:
             return NonDerivativeHoldings()
 
         holdings = []
         for holding_tag in holding_tags:
-            if not isinstance(holding_tag, Tag):
-                continue
-            ownership_nature_tag = holding_tag.find("ownershipNature")
-            if not isinstance(ownership_nature_tag, Tag):
+            ownership_nature_tag = find_element(holding_tag, "ownershipNature")
+            if ownership_nature_tag is None:
                 continue
             holding = dict(
                 [
@@ -119,13 +139,13 @@ class NonDerivativeTable:
         return NonDerivativeHoldings(holdings_df)
 
     @staticmethod
-    def extract_transactions(table: Tag) -> NonDerivativeTransactions:
+    def extract_transactions(table: XmlNode) -> NonDerivativeTransactions:
         """
         Extract transactions from the table tag
         :param table:
         :return:
         """
-        transaction_tags = table.find_all("nonDerivativeTransaction")
+        transaction_tags = find_all_elements(table, "nonDerivativeTransaction")
         if len(transaction_tags) == 0:
             return NonDerivativeTransactions(
                 pd.DataFrame(columns=['Date', 'Security', 'Shares', 'Remaining', 'Price', 'AcquiredDisposed',
@@ -133,16 +153,14 @@ class NonDerivativeTable:
             )
         transactions = []
         for transaction_tag in transaction_tags:
-            if not isinstance(transaction_tag, Tag):
+            transaction_amt_tag = find_element(transaction_tag, "transactionAmounts")
+            if transaction_amt_tag is None:
                 continue
-            transaction_amt_tag = transaction_tag.find("transactionAmounts")
-            if not isinstance(transaction_amt_tag, Tag):
+            ownership_nature_tag = find_element(transaction_tag, "ownershipNature")
+            if ownership_nature_tag is None:
                 continue
-            ownership_nature_tag = transaction_tag.find("ownershipNature")
-            if not isinstance(ownership_nature_tag, Tag):
-                continue
-            post_transaction_tag = transaction_tag.find("postTransactionAmounts")
-            if not isinstance(post_transaction_tag, Tag):
+            post_transaction_tag = find_element(transaction_tag, "postTransactionAmounts")
+            if post_transaction_tag is None:
                 continue
 
             transaction = dict(
@@ -161,8 +179,8 @@ class NonDerivativeTable:
                     ('footnotes', get_footnotes(transaction_tag)),
                 ]
             )
-            transaction_coding_tag = transaction_tag.find("transactionCoding")
-            if transaction_coding_tag and isinstance(transaction_coding_tag, Tag):
+            transaction_coding_tag = find_element(transaction_tag, "transactionCoding")
+            if transaction_coding_tag is not None:
                 transaction_coding = dict(
                     [
                         ('form', child_text(transaction_coding_tag, 'transactionFormType')),
@@ -173,7 +191,7 @@ class NonDerivativeTable:
                 transaction.update(transaction_coding)
 
             transactions.append(transaction)
-        transaction_df = (pd.DataFrame(transactions)
+        transaction_df = (_ensure_coding_columns(pd.DataFrame(transactions))
         .assign(
             TransactionType=lambda df: df.Code.apply(lambda x: TransactionCode.TRANSACTION_TYPES.get(x, x)))
         )
@@ -234,35 +252,33 @@ class DerivativeTable:
 
     @classmethod
     def extract(cls,
-                table: Tag,
+                table: Optional[XmlNode],
                 form: str):
-        if not table:
+        if table is None:
             return cls(holdings=DerivativeHoldings(), transactions=DerivativeTransactions(), form=form)
         transactions = cls.extract_transactions(table)
         holdings = cls.extract_holdings(table)
         return cls(transactions=transactions, holdings=holdings, form=form)
 
     @staticmethod
-    def extract_transactions(table: Tag) -> DerivativeTransactions:
-        trans_tags = table.find_all("derivativeTransaction")
+    def extract_transactions(table: XmlNode) -> DerivativeTransactions:
+        trans_tags = find_all_elements(table, "derivativeTransaction")
         if len(trans_tags) == 0:
             return DerivativeTransactions()
 
         transactions = []
         for transaction_tag in trans_tags:
-            if not isinstance(transaction_tag, Tag):
+            transaction_amt_tag = find_element(transaction_tag, "transactionAmounts")
+            if transaction_amt_tag is None:
                 continue
-            transaction_amt_tag = transaction_tag.find("transactionAmounts")
-            if not isinstance(transaction_amt_tag, Tag):
+            underlying_tag = find_element(transaction_tag, "underlyingSecurity")
+            if underlying_tag is None:
                 continue
-            underlying_tag = transaction_tag.find("underlyingSecurity")
-            if not isinstance(underlying_tag, Tag):
+            ownership_nature_tag = find_element(transaction_tag, "ownershipNature")
+            if ownership_nature_tag is None:
                 continue
-            ownership_nature_tag = transaction_tag.find("ownershipNature")
-            if not isinstance(ownership_nature_tag, Tag):
-                continue
-            post_transaction_tag = transaction_tag.find("postTransactionAmounts")
-            if not isinstance(post_transaction_tag, Tag):
+            post_transaction_tag = find_element(transaction_tag, "postTransactionAmounts")
+            if post_transaction_tag is None:
                 continue
 
             transaction = dict(
@@ -286,8 +302,8 @@ class DerivativeTable:
             )
 
             # Add transaction coding
-            transaction_coding_tag = transaction_tag.find("transactionCoding")
-            if transaction_coding_tag and isinstance(transaction_coding_tag, Tag):
+            transaction_coding_tag = find_element(transaction_tag, "transactionCoding")
+            if transaction_coding_tag is not None:
                 transaction_coding = dict(
                     [
                         ('form', child_text(transaction_coding_tag, 'transactionFormType')),
@@ -299,7 +315,7 @@ class DerivativeTable:
             transactions.append(transaction)
 
         # Now create the transaction dataframe
-        transaction_df = (pd.DataFrame(transactions)
+        transaction_df = (_ensure_coding_columns(pd.DataFrame(transactions))
         .assign(
             TransactionType=lambda df: df.Code.apply(lambda x: TransactionCode.TRANSACTION_TYPES.get(x, x)))
         )
@@ -315,19 +331,17 @@ class DerivativeTable:
         return DerivativeTransactions(transaction_df)
 
     @staticmethod
-    def extract_holdings(table: Tag) -> DerivativeHoldings:
-        holding_tags = table.find_all("derivativeHolding")
+    def extract_holdings(table: XmlNode) -> DerivativeHoldings:
+        holding_tags = find_all_elements(table, "derivativeHolding")
         if len(holding_tags) == 0:
             return DerivativeHoldings()
         holdings = []
         for holding_tag in holding_tags:
-            if not isinstance(holding_tag, Tag):
+            underlying_security_tag = find_element(holding_tag, "underlyingSecurity")
+            if underlying_security_tag is None:
                 continue
-            underlying_security_tag = holding_tag.find("underlyingSecurity")
-            if not isinstance(underlying_security_tag, Tag):
-                continue
-            ownership_nature = holding_tag.find("ownershipNature")
-            if not isinstance(ownership_nature, Tag):
+            ownership_nature = find_element(holding_tag, "ownershipNature")
+            if ownership_nature is None:
                 continue
 
             holding = dict(

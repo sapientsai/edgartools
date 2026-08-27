@@ -35,15 +35,48 @@ from edgar.xbrl.parsers import XBRLParser
 from edgar.xbrl.period_selector import select_periods
 from edgar.xbrl.periods import get_period_views
 from edgar.xbrl.rendering import RenderedStatement, generate_rich_representation, render_statement
+from edgar.exceptions import NotFoundError
 from edgar.xbrl.statement_resolver import StatementResolver
 from edgar.xbrl.statements import statement_to_concepts
 
 
-class XBRLFilingWithNoXbrlData(Exception):
+
+
+class XBRLFilingWithNoXbrlData(NotFoundError):
     """Exception raised when a filing does not contain XBRL data."""
 
     def __init__(self, message: str):
         super().__init__(message)
+
+
+def no_xbrl_attachments(filing) -> XBRLFilingWithNoXbrlData:
+    """The error for a filing that carries no XBRL attachments at all.
+
+    Built as a value rather than raised, so `warn_will_raise` decides — and so
+    the frame between the warning and the user is not one of ours, which is
+    what keeps `stacklevel` pointing at the line the reader has to change. Same
+    shape as `_no_xml_to_parse` in `edgar/__init__.py`, for the same reasons.
+
+    Lives here, next to the class and the condition it describes, but is raised
+    from `Financials.extract` rather than from `from_filing`: `filing.xbrl()`
+    answering `None` is a documented true absence, while a truthy `Financials`
+    whose accessors all answer `None` is the failure worth naming.
+    """
+    error = XBRLFilingWithNoXbrlData(
+        f"Filing {filing.accession_no} ({filing.form}) has no XBRL attachments, "
+        f"so there are no financial statements to read from it. This is a "
+        f"property of the filing, not of the form — SEC phased XBRL in between "
+        f"2009 and 2011, and filings from before then carry none."
+    )
+    # Stable across filings so a walk through a company's whole filing history
+    # warns once, not once per pre-2009 filing — see warn_will_raise.
+    error.warning_summary = (
+        "This filing has no XBRL attachments, so there are no financial "
+        "statements to read from it. This is a property of the filing, not of "
+        "the form — SEC phased XBRL in between 2009 and 2011, and filings from "
+        "before then carry none."
+    )
+    return error
 
 
 class XBRLAttachments:
@@ -591,7 +624,9 @@ class XBRL:
             filing: Filing object with attachments containing XBRL files
 
         Returns:
-            XBRL object with parsed data
+            XBRL object with parsed data, or `None` when the filing carries no
+            XBRL attachments at all — a property of the filing, not a failure to
+            read it, and one this keeps answering with a quiet `None` in 6.0.
         """
         if filing.form.endswith("/A"):
             log.debug(dedent(f"""
@@ -605,6 +640,12 @@ class XBRL:
         xbrl_attachments = XBRLAttachments(filing.attachments)
 
         if xbrl_attachments.empty:
+            # Silent on purpose. `filing.xbrl()` answering None for a filing
+            # with no XBRL is a true absence, not a failure, and docs/upgrade/
+            # 6.0.md commits to it staying that way. The silent-None bug this
+            # module was implicated in (edgartools-07lk.10.1) is one level up,
+            # where `Financials` wraps this None into a truthy object whose
+            # every accessor answers None — so that is where the warning went.
             log.debug(f"No XBRL attachments found in filing {filing}")
             return None
 

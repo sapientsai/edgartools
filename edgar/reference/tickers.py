@@ -4,12 +4,14 @@ import re
 from enum import Enum
 from functools import lru_cache
 from io import StringIO
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 import pyarrow as pa
 
-from edgar.core import get_edgar_data_directory, listify, log
+from edgar.core import listify, log
+from edgar.settings import get_edgar_data_directory
+from edgar.exceptions import http_status
 from edgar.httprequests import download_file, download_json
 from edgar.reference.data.common import read_csv_from_package, read_parquet_from_package
 
@@ -21,6 +23,59 @@ __all__ = ['cusip_ticker_mapping', 'get_ticker_from_cusip', 'get_company_tickers
            ]
 
 from edgar.urls import build_company_tickers_exchange_url, build_company_tickers_url, build_mutual_fund_tickers_url, build_ticker_url
+
+# The bundled CUSIP->Ticker table (ct.pq) is generated upstream by edgar-storage
+# and merged in by scripts/build_ct_pq.py, and it has arrived with symbols that
+# are not symbols. Three families seen so far:
+#
+#   1. A placeholder concatenated onto a real ticker: 'FERG' + 'XXXX'. The feed
+#      uses a bare 'XXXX' when it does not know the symbol, so a CUSIP observed
+#      under both its real symbol and the placeholder emits 'FERGXXXX'.
+#   2. Corporate-action artifacts: 'Q999SPNOFF', 'T014RTSPYMNT', '3111REG'.
+#   3. Bare CUSIP fragments standing in for a symbol: '9105', 'B354MR'.
+#
+# None of these resolve to anything, and the 13F parsers assign this value
+# straight into a user-facing Ticker column, so leaving them in renders wrong
+# data rather than an empty cell. Strip the placeholder (which recovers a real
+# ticker) and drop whatever still is not shaped like a symbol.
+# See GH #978, upstream edgar-storage#5.
+_PLACEHOLDER_TICKER_SUFFIX = r"XXXX$"
+
+# Deliberately permissive at 7 characters: it keeps the preferred-share
+# convention this feed uses ('MITTPRA' for MITT series A) and class suffixes
+# ('BRK.A', 'BF-B'), while rejecting family 2 and 3 above.
+_VALID_TICKER_PATTERN = r"[A-Z][A-Z0-9.\-]{0,6}"
+
+
+def sanitize_cusip_tickers(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    """
+    Drop malformed symbols from a [Cusip, Ticker] frame.
+
+    Internal — used by scripts/build_ct_pq.py when regenerating ct.pq, and by the
+    tests that guard the bundled file. Not part of the public API.
+
+    Returns the cleaned frame alongside a count per rule, so a rebuild can report
+    what it threw away and refuse to ship a file that suddenly rejects far more
+    than usual.
+    """
+    original = df["Ticker"].astype("string").fillna("").str.strip()
+    stripped = original.str.replace(_PLACEHOLDER_TICKER_SUFFIX, "", regex=True)
+    well_formed = stripped.str.fullmatch(_VALID_TICKER_PATTERN).fillna(False)
+
+    stats = {
+        "rows_in": len(df),
+        "placeholder_suffix_stripped": int((stripped != original).sum()),
+        "dropped_empty": int((stripped.str.len() == 0).sum()),
+        "dropped_malformed": int((~well_formed & (stripped.str.len() > 0)).sum()),
+    }
+
+    cleaned = (
+        df.assign(Ticker=stripped.astype(str))
+        .loc[well_formed.to_numpy()]
+        .reset_index(drop=True)
+    )
+    stats["rows_out"] = len(cleaned)
+    return cleaned, stats
 
 
 @lru_cache(maxsize=1)
@@ -569,13 +624,17 @@ def get_icon_from_ticker(ticker: str) -> Optional[bytes]:
         return downloaded if isinstance(downloaded, bytes) else None
     except Exception as e:
         # If the status code is 404, the icon is not available.
-        # Duck-type on the response rather than the exception class: depending on
+        # Duck-type on the status rather than the exception class: depending on
         # the installed httpx build the raised type may not be our imported
         # HTTPStatusError (e.g. CI environments surface it under a different module
-        # identity such as httpx2), so matching on isinstance is fragile. Any
-        # exception that isn't a 404 is re-raised unchanged.
-        response = getattr(e, "response", None)
-        if response is not None and getattr(response, "status_code", None) == 404:
+        # identity such as httpx2), so matching on isinstance is fragile. It is
+        # also why this reads the status through http_status() — under
+        # EDGARTOOLS_STRICT_ERRORS the boundary raises a TransportError, which
+        # carries `.status_code` and no `.response` at all, and a check written
+        # against `.response` silently stops recognising the 404 and starts
+        # raising for every ticker without an icon. Anything that isn't a 404 is
+        # re-raised unchanged.
+        if http_status(e) == 404:
             return None
         raise
 

@@ -17,7 +17,7 @@ from edgar import get_filings, Filings, Filing, get_entity, get_by_accession_num
 from edgar._filings import FilingHomepage, read_fixed_width_index, form_specs, company_specs, Attachment, \
     filing_date_to_year_quarters, get_filing_by_accession
 from edgar.company_reports import TenK
-from edgar.core import default_page_size
+from edgar.settings import default_page_size
 from edgar.entity import Company
 from edgar._filings import read_index_file
 
@@ -749,15 +749,40 @@ def test_as_company_filing(carbo_10k_filing):
 
 @pytest.mark.fast
 @pytest.mark.vcr
-def test_10K_filing_with_no_financial_data():
+def test_10K_filing_with_no_financial_data(monkeypatch):
+    """An ABS trust's 10-K carries no XBRL, and both lanes of that are pinned here.
+
+    This test asserted the hollow `Financials` alone until edgartools-07lk.10.1
+    gave that path a voice, at which point it failed in the strict lane — which
+    is the lane doing its job: it exists to find OUR code still relying on the
+    pre-6.0 behaviour. The repair is to say which lane each claim belongs to,
+    not to drop the claim.
+
+    The env var is set explicitly in both directions rather than inherited, so
+    the two halves assert the same things wherever the suite runs, and the flag
+    itself is what the test shows to be the switch.
+    """
+    from edgar.financials import Financials
+    from edgar.xbrl.xbrl import XBRLFilingWithNoXbrlData
+
     filing = Filing(form='10-K', filing_date='2023-05-26', company='CarMax Auto Owner Trust 2019-3', cik=1779026,
                     accession_no='0001779026-23-000027')
     tenk: TenK = filing.obj()
-    assert tenk.financials
+
+    # 5.x: the hollow object stays, and now says so once, on first access.
+    monkeypatch.delenv("EDGARTOOLS_STRICT_ERRORS", raising=False)
+    with pytest.warns(FutureWarning, match="no XBRL"):
+        assert tenk.financials
     assert not tenk.balance_sheet
     assert not tenk.income_statement
     assert not tenk.cash_flow_statement
     print(tenk)
+
+    # 6.0, today, under the flag. Reuses the same filing: `Financials.extract`
+    # is the line that changes, and `tenk.financials` has cached its answer.
+    monkeypatch.setenv("EDGARTOOLS_STRICT_ERRORS", "1")
+    with pytest.raises(XBRLFilingWithNoXbrlData):
+        Financials.extract(filing)
 
 @pytest.mark.fast
 def test_text_url_for_filing(carbo_10k_filing):
@@ -844,10 +869,13 @@ def test_filing_date_to_year_quarter():
     ]
 
     # Test case 5: Open-ended date range (end date only)
+    # The default start (edgartools-g00j) is 1993-01-01, matching the earliest
+    # quarter SEC's full-index actually serves - see available_quarters() in
+    # edgar/_filings.py.
     assert filing_date_to_year_quarters(":2022-01-01") == [
         (year, quarter)
-        for year in range(1994, 2023)
-        for quarter in (range(2, 5) if year == 1994 else range(1, 2) if year == 2022 else range(1, 5))
+        for year in range(1993, 2023)
+        for quarter in (range(1, 2) if year == 2022 else range(1, 5))
     ]
 
 

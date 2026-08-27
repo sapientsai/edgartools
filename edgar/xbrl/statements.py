@@ -16,7 +16,7 @@ from rich.table import Table
 
 from edgar.richtools import repr_rich
 from edgar.xbrl.dimensions import is_breakdown_dimension
-from edgar.xbrl.exceptions import StatementNotFound
+from edgar.exceptions import ParsingError, StatementNotFoundError
 from edgar.xbrl.presentation import StatementView, ViewType, normalize_view
 
 # XBRL structural element patterns (Issue #03zg)
@@ -344,7 +344,9 @@ statement_to_concepts = {
 }
 
 
-class StatementValidationError(Exception):
+
+
+class StatementValidationError(ParsingError):
     """Raised when statement validation fails."""
     pass
 
@@ -467,12 +469,12 @@ class Statement:
         from edgar.xbrl.core import STANDARD_TAXONOMIES, STANDARD_LABEL, split_element_id
 
         # Resolve to the statement's role URI using the same path render() uses.
-        # find_statement() raises StatementNotFound for unresolvable inputs;
+        # find_statement() raises StatementNotFoundError for unresolvable inputs;
         # this method should fail silent and return [] instead.
         lookup_key = self.canonical_type if self.canonical_type else self.role_or_type
         try:
             _, role_uri, _ = self.xbrl.find_statement(lookup_key)
-        except StatementNotFound:
+        except StatementNotFoundError:
             return []
         if not role_uri:
             return []
@@ -2435,7 +2437,7 @@ class Statements:
         """
         from edgar.core import log
 
-        if isinstance(e, StatementNotFound):
+        if isinstance(e, StatementNotFoundError):
             # Custom exception already has detailed context
             log.warning(str(e))
         else:
@@ -2606,7 +2608,7 @@ class Statements:
         type_accessors = {
             'IncomeStatement': '.income_statement()',
             'BalanceSheet': '.balance_sheet()',
-            'CashFlowStatement': '.cashflow_statement()',
+            'CashFlowStatement': '.cash_flow_statement()',
             'StatementOfEquity': '.statement_of_equity()',
             'ComprehensiveIncome': '.comprehensive_income()',
             'CoverPage': '.cover_page()',
@@ -2745,12 +2747,12 @@ class Statements:
             type_accessors = {
                 'IncomeStatement': '.income_statement()',
                 'BalanceSheet': '.balance_sheet()',
-                'CashFlowStatement': '.cashflow_statement()',
+                'CashFlowStatement': '.cash_flow_statement()',
                 'StatementOfEquity': '.statement_of_equity()',
                 'ComprehensiveIncome': '.comprehensive_income()',
                 'IncomeStatementParenthetical': '.income_statement(parenthetical=True)',
                 'BalanceSheetParenthetical': '.balance_sheet(parenthetical=True)',
-                'CashFlowStatementParenthetical': '.cashflow_statement(parenthetical=True)',
+                'CashFlowStatementParenthetical': '.cash_flow_statement(parenthetical=True)',
                 'StatementOfEquityParenthetical': '.statement_of_equity(parenthetical=True)',
                 'ComprehensiveIncomeParenthetical': '.comprehensive_income(parenthetical=True)',
                 'CoverPage': '.cover_page()',
@@ -2914,7 +2916,7 @@ class Statements:
         except Exception as e:
             return self._handle_statement_error(e, "IncomeStatement")
 
-    def cashflow_statement(self, parenthetical: bool = False,
+    def cash_flow_statement(self, parenthetical: bool = False,
                            view: ViewType = None,
                            include_dimensions: Optional[bool] = None) -> Optional[Statement]:
         """
@@ -2947,9 +2949,16 @@ class Statements:
         except Exception as e:
             return self._handle_statement_error(e, "CashFlowStatement")
 
-    def cash_flow_statement(self, **kwargs):
-        """Alias for cashflow_statement()."""
-        return self.cashflow_statement(**kwargs)
+    def cashflow_statement(self, **kwargs):
+        """Deprecated: use :meth:`cash_flow_statement`."""
+        warnings.warn(
+            "cashflow_statement() is deprecated and will be removed in v6.0. "
+            "Use cash_flow_statement(), which matches income_statement() and "
+            "balance_sheet().",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.cash_flow_statement(**kwargs)
 
     def statement_of_equity(self, parenthetical: bool = False,
                             view: ViewType = None,
@@ -3428,7 +3437,7 @@ class StitchedStatements:
             statement.show_date_range = show_date_range
         return statement
 
-    def cashflow_statement(self, max_periods: int = 8, standard: bool = True,
+    def cash_flow_statement(self, max_periods: int = 8, standard: bool = True,
                            use_optimal_periods: bool = True, show_date_range: bool = False,
                            include_dimensions: bool = False, view: ViewType = None,
                            discrete_quarters: bool = False,
@@ -3462,9 +3471,16 @@ class StitchedStatements:
             statement.show_date_range = show_date_range
         return statement
 
-    def cash_flow_statement(self, **kwargs):
-        """Alias for cashflow_statement()."""
-        return self.cashflow_statement(**kwargs)
+    def cashflow_statement(self, **kwargs):
+        """Deprecated: use :meth:`cash_flow_statement`."""
+        warnings.warn(
+            "cashflow_statement() is deprecated and will be removed in v6.0. "
+            "Use cash_flow_statement(), which matches income_statement() and "
+            "balance_sheet().",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.cash_flow_statement(**kwargs)
 
     def statement_of_equity(self, max_periods: int = 8, standard: bool = True,
                             use_optimal_periods: bool = True, show_date_range: bool = False,

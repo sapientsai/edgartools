@@ -6,7 +6,7 @@ import re
 from typing import List, Optional, Set
 
 from edgar.documents.document import Document
-from edgar.documents.nodes import HeadingNode, Node, ParagraphNode, TextNode
+from edgar.documents.nodes import HeadingNode, ImageNode, Node, ParagraphNode, TextNode
 from edgar.documents.table_nodes import TableNode
 
 
@@ -27,6 +27,7 @@ class TextExtractor:
                  include_tables: bool = True,
                  include_metadata: bool = False,
                  include_links: bool = False,
+                 include_images: bool = False,
                  max_length: Optional[int] = None,
                  preserve_structure: bool = False,
                  table_max_col_width: Optional[int] = None):
@@ -38,6 +39,9 @@ class TextExtractor:
             include_tables: Include table content
             include_metadata: Include metadata annotations
             include_links: Include link URLs
+            include_images: Emit an ``[Image: <alt or filename>]`` placeholder for
+                            each image so graphical content is not silently
+                            dropped (default False — keeps clean text image-free).
             max_length: Maximum text length
             preserve_structure: Preserve document structure with markers
             table_max_col_width: Maximum column width for table rendering (default: 200).
@@ -47,6 +51,7 @@ class TextExtractor:
         self.include_tables = include_tables
         self.include_metadata = include_metadata
         self.include_links = include_links
+        self.include_images = include_images
         self.max_length = max_length
         self.preserve_structure = preserve_structure
         self.table_max_col_width = table_max_col_width
@@ -135,7 +140,20 @@ class TextExtractor:
                 if self.include_metadata and node.metadata:
                     text = self._annotate_with_metadata(text, node.metadata)
                 parts.append(text)
-            # Don't process children since we already got the paragraph text
+            # Don't process children since we already got the paragraph text.
+            # That skip is why images need handling here as well: SEC filers wrap
+            # them in a paragraph, so the ImageNode branch below is never reached
+            # for a real filing and the placeholder never appeared. (GH #886)
+            if self.include_images:
+                for descendant in node.walk():
+                    if isinstance(descendant, ImageNode):
+                        self._append_image_placeholder(descendant, parts)
+            return
+
+        elif isinstance(node, ImageNode):
+            # Reached only for an image that is not inside a paragraph.
+            if self.include_images:
+                self._append_image_placeholder(node, parts)
             return
 
         else:
@@ -172,6 +190,17 @@ class TextExtractor:
         # Process children
         for child in node.children:
             self._extract_from_node(child, parts, depth + 1)
+
+    def _append_image_placeholder(self, node: ImageNode, parts: List[str]):
+        """Emit ``[Image: <alt or filename>]`` for one image.
+
+        Falls back to the source file name because filers routinely leave ``alt``
+        empty on the images that matter most — a stock performance graph is
+        usually ``<img src="xyz_g2.jpg">`` and nothing else.
+        """
+        label = (node.alt or '').strip() or (node.src or '').rsplit('/', 1)[-1]
+        if label:
+            parts.append(f"[Image: {label}]")
 
     def _extract_heading(self, node: HeadingNode, parts: List[str], depth: int):
         """Extract heading with optional structure markers."""

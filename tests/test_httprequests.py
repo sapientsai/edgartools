@@ -17,12 +17,13 @@ from edgar.httpclient import (
 
 from edgar.httprequests import (
     get_with_retry,
+    redirect_url,
     get_with_retry_async,
     stream_with_retry,
     post_with_retry,
     post_with_retry_async,
     TooManyRequestsError,
-    IdentityNotSetException,
+    IdentityNotSetError,
     SSLVerificationError,
     is_ssl_error,
     should_retry,
@@ -66,6 +67,49 @@ def test_get_with_retry_for_redirect(status_code, monkeypatch):
                 headers={"User-Agent": "Dev Gunning developer-gunning@gmail.com"},
                 identity_callable=None,
             )
+
+
+@pytest.mark.parametrize(
+    "location,expected",
+    [
+        # SEC's own form: a bare path, which has no scheme for httpx to dial.
+        ("/data-research/investment-company", "https://www.sec.gov/data-research/investment-company"),
+        ("sibling", "https://www.sec.gov/about/sibling"),
+        ("//data.sec.gov/submissions", "https://data.sec.gov/submissions"),
+        ("https://www.sec.gov/elsewhere", "https://www.sec.gov/elsewhere"),
+    ],
+)
+def test_redirect_url_resolves_against_the_request_url(location, expected):
+    response = httpx.Response(status_code=301, headers={"Location": location})
+    assert redirect_url("https://www.sec.gov/about/opendatasets", response) == expected
+
+
+@pytest.mark.parametrize("status_code", [301, 302])
+def test_get_with_retry_follows_a_relative_location(status_code):
+    """A relative Location must be resolved, not handed to httpx as-is.
+
+    SEC 301s ``/about/opendatasetsshtmlinvestment_company`` to a bare path;
+    requesting that path verbatim raises UnsupportedProtocol, which broke fund
+    reference data (class names silently degraded to class IDs).
+    """
+    mock_response = httpx.Response(status_code=status_code)
+    mock_response.headers["Location"] = "/data-research/investment-company"
+
+    with patch("httpx.Client.get", return_value=mock_response):
+        with patch("edgar.httprequests.get_with_retry") as mock_retry:
+            get_with_retry(url="https://www.sec.gov/about/opendatasets")
+            assert mock_retry.call_args.kwargs["url"] == "https://www.sec.gov/data-research/investment-company"
+
+
+@pytest.mark.parametrize("status_code", [301, 302])
+def test_post_with_retry_follows_a_relative_location(status_code):
+    mock_response = httpx.Response(status_code=status_code)
+    mock_response.headers["Location"] = "/redirected"
+
+    with patch("httpx.Client.post", return_value=mock_response):
+        with patch("edgar.httprequests.post_with_retry") as mock_retry:
+            post_with_retry(url="https://www.sec.gov/cgi-bin/browse-edgar", data={"key": "value"})
+            assert mock_retry.call_args.args[0] == "https://www.sec.gov/redirected"
 
 
 @pytest.mark.asyncio
@@ -124,7 +168,7 @@ async def test_post_with_retry_async():
 def test_identity_not_set_exception(monkeypatch):
     # Remove the EDGAR_IDENTITY environment variable
     monkeypatch.delenv("EDGAR_IDENTITY", raising=False)
-    with pytest.raises(IdentityNotSetException):
+    with pytest.raises(IdentityNotSetError):
         get_with_retry("http://example.com")
 
 
@@ -226,6 +270,27 @@ def test_ssl_verification_applied_to_http_manager(monkeypatch):
     http_mgr = get_http_mgr()
     assert http_mgr.httpx_params["verify"] is True
     assert isinstance(http_mgr.httpx_params["verify"], bool), "verify should be a boolean, not a function"
+
+
+def test_verify_reaches_the_transport_params():
+    """`verify` must survive the last hop, from httpx_params into the transport.
+
+    edgartools used to monkeypatch HttpxThrottleCache._get_httpx_transport_params
+    because it extracted only 'http2' and 'proxy', so configure_http(verify_ssl=False)
+    was silently ignored and users behind SSL-inspecting corporate proxies could not
+    reach EDGAR at all. httpxthrottlecache does this itself now and the patch was
+    removed; this pins the behaviour so an upstream regression fails here rather
+    than in the field. test_ssl_verification_applied_to_http_manager covers the
+    earlier hop (env var -> httpx_params) — this one covers params -> transport.
+    """
+    http_mgr = get_http_mgr()
+
+    assert http_mgr._get_httpx_transport_params({"verify": False})["verify"] is False
+    assert http_mgr._get_httpx_transport_params({"verify": True})["verify"] is True
+
+    # Absent means verify, not "silently off" — the safe default matters more than
+    # the passthrough, since getting it wrong disables TLS checking for everyone.
+    assert http_mgr._get_httpx_transport_params({})["verify"] is True
 
 
 def test_default_http_timeout_is_set(monkeypatch):
